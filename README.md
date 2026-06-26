@@ -76,8 +76,11 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 Press `/` and type to filter the list live (case-insensitive, matches anywhere
 in the track name). While searching: `↑`/`↓` move through results, `Enter`
 plays the highlighted match and keeps the filter, `Esc` clears it. With a
-filter active, `Esc` in normal mode clears it too. Playback (next/prev) still
-walks the full library, not just the filtered results.
+filter active, `Esc` in normal mode clears it too.
+
+**The filtered list becomes the play queue:** while a filter is active,
+next/prev (and auto-advance and shuffle) move only through the matching
+tracks. Clear the filter and the queue returns to the full library.
 
 ## How it works
 

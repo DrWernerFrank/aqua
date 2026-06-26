@@ -70,8 +70,10 @@ static int repeat = 0;       /* loop playlist */
 static int have_pactl = 0;   /* set if PulseAudio's pactl is available */
 static int shuffle = 0;      /* random play order */
 
-/* play order: order[pos] = track index. Identity when shuffle is off. */
-static int *order = NULL;
+/* play queue: the sequence next/prev walk through. It mirrors the current
+ * view[] (so search results become the queue), optionally shuffled. */
+static int *queue = NULL;
+static int nqueue = 0;
 
 /* playback clock */
 static struct timespec t_start;
@@ -338,24 +340,27 @@ static void toggle_pause(void) {
     }
 }
 
-/* position of a track index within the play order (linear, fine for libraries) */
-static int order_pos(int track) {
-    for (int i = 0; i < ntracks; i++)
-        if (order[i] == track) return i;
-    return 0;
+/* position of a track index within the play queue, or -1 if not queued */
+static int queue_pos(int track) {
+    for (int i = 0; i < nqueue; i++)
+        if (queue[i] == track) return i;
+    return -1;
 }
 
-/* (re)build the play order; keep `cur` first so the next pick is fresh */
-static void build_order(void) {
-    for (int i = 0; i < ntracks; i++) order[i] = i;
-    if (!shuffle) return;
-    for (int i = ntracks - 1; i > 0; i--) {     /* Fisher-Yates */
-        int j = rand() % (i + 1);
-        int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+/* (re)build the play queue from the current view; keep `cur` first so the
+ * next pick is fresh. Call this whenever the view or shuffle state changes. */
+static void build_queue(void) {
+    nqueue = nview;
+    for (int i = 0; i < nview; i++) queue[i] = view[i];
+    if (shuffle) {
+        for (int i = nqueue - 1; i > 0; i--) {     /* Fisher-Yates */
+            int j = rand() % (i + 1);
+            int tmp = queue[i]; queue[i] = queue[j]; queue[j] = tmp;
+        }
     }
-    if (cur >= 0) {                              /* move current track to front */
-        int p = order_pos(cur);
-        int tmp = order[0]; order[0] = order[p]; order[p] = tmp;
+    if (cur >= 0) {                                 /* move current track to front */
+        int p = queue_pos(cur);
+        if (p > 0) { int tmp = queue[0]; queue[0] = queue[p]; queue[p] = tmp; }
     }
 }
 
@@ -381,6 +386,7 @@ static void rebuild_view(void) {
         if (ci_contains(tracks[i].name, query)) view[nview++] = i;
     if (sel >= nview) sel = nview ? nview - 1 : 0;
     if (sel < 0) sel = 0;
+    build_queue();   /* the filtered list is the new play queue */
 }
 
 /* move the highlight to a given track index, if it's in the current view */
@@ -390,20 +396,21 @@ static void select_in_view(int track) {
 }
 
 static void next_track(void) {
-    if (ntracks == 0) return;
-    int pos = (cur >= 0) ? order_pos(cur) + 1 : 0;
-    if (pos >= ntracks) { if (!repeat) { stop_child(); cur = -1; return; } pos = 0; }
-    play_track(order[pos], 0);
-    select_in_view(order[pos]);
+    if (nqueue == 0) return;
+    int p = queue_pos(cur);                 /* -1 if current isn't in the queue */
+    int pos = p + 1;                        /* p<0 -> start at 0 */
+    if (pos >= nqueue) { if (!repeat) { stop_child(); cur = -1; return; } pos = 0; }
+    play_track(queue[pos], 0);
+    select_in_view(queue[pos]);
 }
 
 static void prev_track(void) {
-    if (ntracks == 0) return;
+    if (nqueue == 0) return;
     if (elapsed() > 3) { play_track(cur, 0); return; }
-    int pos = (cur >= 0) ? order_pos(cur) - 1 : 0;
-    if (pos < 0) pos = repeat ? ntracks - 1 : 0;
-    play_track(order[pos], 0);
-    select_in_view(order[pos]);
+    int p = queue_pos(cur);
+    int pos = (p > 0) ? p - 1 : (repeat ? nqueue - 1 : 0);
+    play_track(queue[pos], 0);
+    select_in_view(queue[pos]);
 }
 
 static void seek(double delta) {
@@ -626,10 +633,9 @@ int main(int argc, char **argv) {
     }
 
     srand((unsigned)time(NULL));
-    order = malloc(ntracks * sizeof(int));
-    if (!order) { perror("malloc"); return 1; }
-    build_order();
-    rebuild_view();   /* initial view = all tracks */
+    queue = malloc(ntracks * sizeof(int));
+    if (!queue) { perror("malloc"); return 1; }
+    rebuild_view();   /* initial view = all tracks; also builds the queue */
 
     have_pactl = (system("command -v pactl >/dev/null 2>&1") == 0);
 
@@ -713,7 +719,7 @@ int main(int argc, char **argv) {
                     case '-': case '_': set_volume(-5); break;
                     case '+': case '=': set_volume(5); break;
                     case 'r': repeat = !repeat; break;
-                    case 's': shuffle = !shuffle; build_order(); break;
+                    case 's': shuffle = !shuffle; build_queue(); break;
                     case '/': searching = 1; break;
                     case '\033':                  /* esc clears an active filter */
                         if (query[0]) { qlen = 0; query[0] = '\0'; rebuild_view(); }
