@@ -19,12 +19,15 @@ Minimal aqua/black/gray interface, no animations.
 ## Features
 
 - Recursively scans a folder for audio (`mp3 flac ogg wav m4a aac opus wma ...`)
+- **Reads tags** (title, artist, album, track number) and **groups the list by
+  album** — falling back to the containing folder when a track has no album tag
 - Play / pause (true pause via `SIGSTOP`/`SIGCONT`), next / previous, seek
 - **Gapless volume** — adjusts the live PulseAudio stream, no restart
 - **Shuffle** and **repeat**
-- **Duration cache** in `~/.cache/aqua/` — only new or modified files are
+- **Search** across title, artist, album and filename
+- **Metadata cache** in `~/.cache/aqua/` — only new or modified files are
   re-probed, so large libraries open instantly
-- Tiny: a single ~700-line C file, no build dependencies beyond libc
+- Tiny: a single C file, no build dependencies beyond libc
 
 ## Requirements
 
@@ -86,9 +89,12 @@ tracks. Clear the filter and the queue returns to the full library.
 
 - Playback is an `ffplay -nodisp -autoexit` child process. Pause sends it
   `SIGSTOP`/`SIGCONT`; next/seek replace it.
-- Durations are read with `ffprobe` lazily inside the main loop (the UI is
-  responsive immediately) and cached to `~/.cache/aqua/durations.tsv`, keyed by
-  absolute path + modification time. Delete that file to force a full rescan.
+- Metadata (duration + title/artist/album/track) is read with `ffprobe` lazily
+  inside the main loop (the UI is responsive immediately) and cached to
+  `~/.cache/aqua/library.tsv`, keyed by absolute path + modification time.
+  Delete that file to force a full rescan. The list is grouped by album (or
+  folder when untagged) and sorted by track number within each group; on the
+  very first run the grouping settles as tags load, then stays instant.
 - Volume changes locate ffplay's PulseAudio sink-input by PID and set its
   volume with `pactl`, so the audio never cuts out.
 

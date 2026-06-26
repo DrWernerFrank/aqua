@@ -44,11 +44,23 @@
 /* ---- track model ---- */
 typedef struct {
     char *path;     /* full path passed to ffplay */
-    char *name;     /* display name (basename, no extension) */
+    char *name;     /* filename without extension (fallback display) */
     char *abspath;  /* canonical path, used as cache key */
+    char *folder;   /* parent folder name (album fallback) */
     long  mtime;    /* file modification time, for cache validation */
     double dur;     /* seconds, -1 if unknown */
+    /* metadata from tags (NULL when absent) */
+    char *title;
+    char *artist;
+    char *album;
+    char *group;    /* album if tagged, else folder; used for grouping/sort */
+    int   trackno;  /* track number, 0 if unknown */
 } Track;
+
+/* display title: prefer the tag title, fall back to the filename */
+static const char *disp_title(const Track *t) {
+    return (t->title && *t->title) ? t->title : t->name;
+}
 
 static Track *tracks = NULL;
 static int ntracks = 0, capacity = 0;
@@ -116,9 +128,25 @@ static void add_track(const char *path, const char *fname) {
     char *dot = strrchr(buf, '.');
     if (dot) *dot = '\0';
     t->name = xstrdup(buf);
+
+    /* parent folder name (album fallback) */
+    char pbuf[2048];
+    snprintf(pbuf, sizeof pbuf, "%s", path);
+    char *slash = strrchr(pbuf, '/');           /* strip filename */
+    if (slash) {
+        *slash = '\0';
+        char *par = strrchr(pbuf, '/');          /* parent dir basename */
+        t->folder = xstrdup(par ? par + 1 : pbuf);
+    } else {
+        t->folder = xstrdup("");
+    }
+
     t->abspath = NULL;
     t->mtime = 0;
     t->dur = -1;
+    t->title = t->artist = t->album = NULL;
+    t->group = t->folder;        /* refined to album once tags are read */
+    t->trackno = 0;
 }
 
 static void scan_dir(const char *dir, int depth) {
@@ -144,25 +172,53 @@ static int cmp_track(const void *a, const void *b) {
     return strcasecmp(((const Track *)a)->name, ((const Track *)b)->name);
 }
 
-/* ---- duration via ffprobe ---- */
-static double probe_duration(const char *path) {
-    char cmd[2600];
-    snprintf(cmd, sizeof cmd,
-        "ffprobe -v error -show_entries format=duration "
-        "-of default=noprint_wrappers=1:nokey=1 \"%s\" 2>/dev/null", path);
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
-    char out[64] = {0};
-    double dur = -1;
-    if (fgets(out, sizeof out, p)) dur = atof(out);
-    pclose(p);
-    return dur > 0 ? dur : -1;
+/* group = album when tagged, otherwise the parent folder name */
+static void apply_group(Track *t) {
+    t->group = (t->album && *t->album) ? t->album : t->folder;
 }
 
-/* ---- duration cache (~/.cache/aqua/durations.tsv) ----
- * Each line:  <duration>\t<mtime>\t<abspath>
+/* dup a string with tabs/newlines flattened to spaces, or NULL if empty */
+static char *dup_clean(const char *s) {
+    if (!s || !*s) return NULL;
+    char *p = xstrdup(s);
+    for (char *q = p; *q; q++) if (*q == '\t' || *q == '\n' || *q == '\r') *q = ' ';
+    return p;
+}
+
+/* ---- metadata via ffprobe (duration + title/artist/album/track) ---- */
+static void probe_meta(Track *t) {
+    char cmd[2600];
+    snprintf(cmd, sizeof cmd,
+        "ffprobe -v error -show_entries "
+        "format=duration:format_tags=title,artist,album,track,TITLE,ARTIST,ALBUM,TRACK "
+        "-of default=noprint_wrappers=1 \"%s\" 2>/dev/null", t->path);
+    FILE *p = popen(cmd, "r");
+    if (!p) { t->dur = -1; return; }
+    char line[1024];
+    while (fgets(line, sizeof line, p)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = line, *val = eq + 1;
+        size_t L = strlen(val);
+        while (L && (val[L-1] == '\n' || val[L-1] == '\r')) val[--L] = '\0';
+        if (strcmp(key, "duration") == 0)            t->dur = atof(val) > 0 ? atof(val) : -1;
+        else if (strcasecmp(key, "TAG:title") == 0)  { free(t->title);  t->title  = dup_clean(val); }
+        else if (strcasecmp(key, "TAG:artist") == 0) { free(t->artist); t->artist = dup_clean(val); }
+        else if (strcasecmp(key, "TAG:album") == 0)  { free(t->album);  t->album  = dup_clean(val); }
+        else if (strcasecmp(key, "TAG:track") == 0)  t->trackno = atoi(val);  /* "3/12" -> 3 */
+    }
+    pclose(p);
+    apply_group(t);
+}
+
+/* ---- metadata cache (~/.cache/aqua/library.tsv) ----
+ * Each line: <mtime>\t<dur>\t<trackno>\t<title>\t<artist>\t<album>\t<abspath>
  * Only new or modified files are probed; everything else is read from here. */
-typedef struct { char *path; long mtime; double dur; } CacheEnt;
+typedef struct {
+    char *path; long mtime; double dur; int trackno;
+    char *title, *artist, *album;
+} CacheEnt;
 static CacheEnt *cache = NULL;
 static int ncache = 0, capcache = 0;
 static char cache_file[PATH_MAX];
@@ -179,70 +235,92 @@ static void init_cache_path(void) {
     mkdir(dir, 0755);
     snprintf(dir, sizeof dir, "%.*s/.cache/aqua", (int)(sizeof dir - 32), home);
     mkdir(dir, 0755);
-    snprintf(cache_file, sizeof cache_file, "%.*s/durations.tsv",
+    snprintf(cache_file, sizeof cache_file, "%.*s/library.tsv",
              (int)(sizeof cache_file - 20), dir);
+}
+
+/* take the next tab-delimited field, advancing *pp past the tab */
+static char *next_field(char **pp) {
+    char *s = *pp;
+    char *tab = strchr(s, '\t');
+    if (tab) { *tab = '\0'; *pp = tab + 1; }
+    else     { *pp = s + strlen(s); }
+    return s;
 }
 
 static void load_cache(void) {
     FILE *f = fopen(cache_file, "r");
     if (!f) return;
-    char line[PATH_MAX + 64];
+    char line[PATH_MAX + 256];
     while (fgets(line, sizeof line, f)) {
+        size_t L = strlen(line);
+        if (L && line[L-1] == '\n') line[--L] = '\0';
         char *p = line;
-        double dur = strtod(p, &p);   if (*p != '\t') continue; p++;
-        long  mt  = strtol(p, &p, 10); if (*p != '\t') continue; p++;
-        size_t L = strlen(p);
-        if (L && p[L - 1] == '\n') p[L - 1] = '\0';
-        if (!*p) continue;
+        long  mt   = strtol(next_field(&p), NULL, 10);
+        double dur = strtod(next_field(&p), NULL);
+        int   trk  = atoi(next_field(&p));
+        char *title  = next_field(&p);
+        char *artist = next_field(&p);
+        char *album  = next_field(&p);
+        char *path   = p;                 /* remainder is the path */
+        if (!*path) continue;
         if (ncache == capcache) {
             capcache = capcache ? capcache * 2 : 256;
             cache = realloc(cache, capcache * sizeof(CacheEnt));
             if (!cache) { perror("realloc"); exit(1); }
         }
-        cache[ncache].path = xstrdup(p);
-        cache[ncache].mtime = mt;
-        cache[ncache].dur = dur;
-        ncache++;
+        CacheEnt *e = &cache[ncache++];
+        e->path = xstrdup(path);
+        e->mtime = mt; e->dur = dur; e->trackno = trk;
+        e->title  = *title  ? xstrdup(title)  : NULL;
+        e->artist = *artist ? xstrdup(artist) : NULL;
+        e->album  = *album  ? xstrdup(album)  : NULL;
     }
     fclose(f);
     qsort(cache, ncache, sizeof(CacheEnt), cmp_cache);
 }
 
-static double cache_lookup(const char *path, long mtime) {
-    if (ncache == 0) return -1;
+static CacheEnt *cache_lookup(const char *path, long mtime) {
+    if (ncache == 0) return NULL;
     CacheEnt key; key.path = (char *)path;
     CacheEnt *e = bsearch(&key, cache, ncache, sizeof(CacheEnt), cmp_cache);
-    return (e && e->mtime == mtime) ? e->dur : -1;
+    return (e && e->mtime == mtime) ? e : NULL;
 }
 
-/* insert or update an entry (linear; runs once at save time) */
-static void cache_upsert(const char *path, long mtime, double dur) {
+/* insert or update an entry from a track (linear; runs once at save time) */
+static void cache_upsert(const Track *t) {
+    CacheEnt *e = NULL;
     for (int i = 0; i < ncache; i++)
-        if (strcmp(cache[i].path, path) == 0) {
-            cache[i].mtime = mtime; cache[i].dur = dur; return;
+        if (strcmp(cache[i].path, t->abspath) == 0) { e = &cache[i]; break; }
+    if (!e) {
+        if (ncache == capcache) {
+            capcache = capcache ? capcache * 2 : 256;
+            cache = realloc(cache, capcache * sizeof(CacheEnt));
+            if (!cache) { perror("realloc"); exit(1); }
         }
-    if (ncache == capcache) {
-        capcache = capcache ? capcache * 2 : 256;
-        cache = realloc(cache, capcache * sizeof(CacheEnt));
-        if (!cache) { perror("realloc"); exit(1); }
+        e = &cache[ncache++];
+        e->path = xstrdup(t->abspath);
     }
-    cache[ncache].path = xstrdup(path);
-    cache[ncache].mtime = mtime;
-    cache[ncache].dur = dur;
-    ncache++;
+    e->mtime = t->mtime; e->dur = t->dur; e->trackno = t->trackno;
+    e->title  = t->title;   /* shares the track's strings; only used until save */
+    e->artist = t->artist;
+    e->album  = t->album;
 }
 
-/* merge current durations into the cache and write it out (preserves entries
- * for other folders the user may have opened before). */
 static void save_cache(void) {
     if (!cache_file[0]) return;
     for (int i = 0; i < ntracks; i++)
         if (tracks[i].dur > 0 && tracks[i].abspath)
-            cache_upsert(tracks[i].abspath, tracks[i].mtime, tracks[i].dur);
+            cache_upsert(&tracks[i]);
     FILE *f = fopen(cache_file, "w");
     if (!f) return;
-    for (int i = 0; i < ncache; i++)
-        fprintf(f, "%.3f\t%ld\t%s\n", cache[i].dur, cache[i].mtime, cache[i].path);
+    for (int i = 0; i < ncache; i++) {
+        CacheEnt *e = &cache[i];
+        fprintf(f, "%ld\t%.3f\t%d\t%s\t%s\t%s\t%s\n",
+                e->mtime, e->dur, e->trackno,
+                e->title ? e->title : "", e->artist ? e->artist : "",
+                e->album ? e->album : "", e->path);
+    }
     fclose(f);
 }
 
@@ -378,12 +456,36 @@ static int ci_contains(const char *hay, const char *needle) {
     return 0;
 }
 
-/* rebuild the filtered view from the current query */
+/* a track matches the query if any of its fields contain it */
+static int track_matches(const Track *t, const char *q) {
+    if (!*q) return 1;
+    return ci_contains(t->name, q)
+        || (t->title  && ci_contains(t->title, q))
+        || (t->artist && ci_contains(t->artist, q))
+        || (t->album  && ci_contains(t->album, q));
+}
+
+/* order the view by album group, then track number, then title */
+static int cmp_view(const void *a, const void *b) {
+    const Track *ta = &tracks[*(const int *)a];
+    const Track *tb = &tracks[*(const int *)b];
+    int c = strcasecmp(ta->group, tb->group);
+    if (c) return c;
+    if (ta->trackno != tb->trackno) {        /* numbered tracks first, in order */
+        if (ta->trackno == 0) return 1;
+        if (tb->trackno == 0) return -1;
+        return ta->trackno - tb->trackno;
+    }
+    return strcasecmp(disp_title(ta), disp_title(tb));
+}
+
+/* rebuild the filtered, album-grouped view from the current query */
 static void rebuild_view(void) {
     if (!view) view = malloc((ntracks ? ntracks : 1) * sizeof(int));
     nview = 0;
     for (int i = 0; i < ntracks; i++)
-        if (ci_contains(tracks[i].name, query)) view[nview++] = i;
+        if (track_matches(&tracks[i], query)) view[nview++] = i;
+    qsort(view, nview, sizeof(int), cmp_view);
     if (sel >= nview) sel = nview ? nview - 1 : 0;
     if (sel < 0) sel = 0;
     build_queue();   /* the filtered list is the new play queue */
@@ -455,6 +557,29 @@ static void fmt_time(double s, char *buf, size_t n) {
 
 static int scroll_top = 0;
 
+/* render rows: a track row or an album header row. Built fresh each draw. */
+static int *rr_head = NULL;   /* 1 = header row */
+static int *rr_val  = NULL;   /* header: track idx (for group); track: view pos */
+static int  n_rr = 0;
+
+static void build_rows(void) {
+    if (!rr_head) {
+        rr_head = malloc(2 * (ntracks ? ntracks : 1) * sizeof(int));
+        rr_val  = malloc(2 * (ntracks ? ntracks : 1) * sizeof(int));
+    }
+    n_rr = 0;
+    const char *prev = NULL;
+    for (int pos = 0; pos < nview; pos++) {
+        int ti = view[pos];
+        const char *g = tracks[ti].group;
+        if (!prev || strcasecmp(g, prev) != 0) {
+            rr_head[n_rr] = 1; rr_val[n_rr] = ti; n_rr++;
+            prev = g;
+        }
+        rr_head[n_rr] = 0; rr_val[n_rr] = pos; n_rr++;
+    }
+}
+
 static void draw(void) {
     int rows, cols;
     get_size(&rows, &cols);
@@ -465,9 +590,16 @@ static void draw(void) {
     int list_h = rows - header - footer;
     if (list_h < 1) list_h = 1;
 
-    /* keep selection in view */
-    if (sel < scroll_top) scroll_top = sel;
-    if (sel >= scroll_top + list_h) scroll_top = sel - list_h + 1;
+    build_rows();
+
+    /* find the render row holding the current selection */
+    int selrow = 0;
+    for (int r = 0; r < n_rr; r++)
+        if (!rr_head[r] && rr_val[r] == sel) { selrow = r; break; }
+
+    /* keep selection (and its header just above) on screen */
+    if (selrow - 1 < scroll_top) scroll_top = selrow - 1;
+    if (selrow >= scroll_top + list_h) scroll_top = selrow - list_h + 1;
     if (scroll_top < 0) scroll_top = 0;
 
     char out[1 << 16];
@@ -494,12 +626,12 @@ static void draw(void) {
     else
         o += snprintf(out + o, sizeof out - o, "\033[K\r\n");
 
-    /* list (over the filtered view) */
+    /* list (render rows: album headers + tracks) */
     for (int i = 0; i < list_h; i++) {
-        int vidx = scroll_top + i;
+        int r = scroll_top + i;
         o += snprintf(out + o, sizeof out - o, "\033[K");
-        if (vidx >= nview) {
-            if (nview == 0 && i == 0)
+        if (r >= n_rr) {
+            if (n_rr == 0 && i == 0)
                 o += snprintf(out + o, sizeof out - o,
                     "  " DGRAY "%s" RESET "\r\n",
                     ntracks ? "No matches." : "No tracks.");
@@ -507,24 +639,39 @@ static void draw(void) {
                 o += snprintf(out + o, sizeof out - o, "\r\n");
             continue;
         }
+
+        if (rr_head[r]) {                       /* album / folder header */
+            const char *g = tracks[rr_val[r]].group;
+            int gw = cols - 4;
+            o += snprintf(out + o, sizeof out - o,
+                " " AQUA_B "\xE2\x96\x8C %-*.*s" RESET "\r\n", gw, gw, *g ? g : "(unknown)");
+            continue;
+        }
+
+        int vidx = rr_val[r];
         int idx = view[vidx];
         Track *t = &tracks[idx];
         char dbuf[16];
         fmt_time(t->dur, dbuf, sizeof dbuf);
 
+        char num[16];
+        if (t->trackno > 0) snprintf(num, sizeof num, "%2d", t->trackno);
+        else                snprintf(num, sizeof num, "  ");
+
         const char *marker = (idx == cur) ? (paused ? "\xE2\x9D\x9A " : "\xE2\x96\xB6 ") : "  ";
-        int name_w = cols - 12;
-        if (name_w < 10) name_w = 10;
+        int name_w = cols - 16;
+        if (name_w < 8) name_w = 8;
+        const char *title = disp_title(t);
 
         if (vidx == sel) {
             o += snprintf(out + o, sizeof out - o,
-                INVAQ " %s%-*.*s %5s " RESET "\r\n",
-                marker, name_w, name_w, t->name, dbuf);
+                INVAQ " %s%s %-*.*s %5s " RESET "\r\n",
+                marker, num, name_w, name_w, title, dbuf);
         } else {
             const char *col = (idx == cur) ? AQUA : WHITE;
             o += snprintf(out + o, sizeof out - o,
-                " %s%s%-*.*s" RESET " " DGRAY "%5s" RESET "\r\n",
-                col, marker, name_w, name_w, t->name, dbuf);
+                " %s%s" DGRAY "%s " RESET "%s%-*.*s" RESET " " DGRAY "%5s" RESET "\r\n",
+                col, marker, num, col, name_w, name_w, title, dbuf);
         }
     }
 
@@ -540,9 +687,16 @@ static void draw(void) {
         fmt_time(dur, d, sizeof d);
 
         const char *state = paused ? GRAY "PAUSED" : AQUA "PLAYING";
+        /* "Title — Artist" when an artist tag exists */
+        char now[1024];
+        if (tracks[cur].artist && *tracks[cur].artist)
+            snprintf(now, sizeof now, "%s \xE2\x80\x94 %s",
+                     disp_title(&tracks[cur]), tracks[cur].artist);
+        else
+            snprintf(now, sizeof now, "%s", disp_title(&tracks[cur]));
         o += snprintf(out + o, sizeof out - o,
             "  %s" RESET " " WHITE "%-*.*s" RESET "\033[K\r\n",
-            state, cols - 14, cols - 14, tracks[cur].name);
+            state, cols - 14, cols - 14, now);
 
         /* progress bar */
         int bar_w = cols - 20;
@@ -628,8 +782,15 @@ int main(int argc, char **argv) {
     init_cache_path();
     load_cache();
     for (int i = 0; i < ntracks; i++) {
-        double d = cache_lookup(tracks[i].abspath, tracks[i].mtime);
-        if (d > 0) tracks[i].dur = d;
+        CacheEnt *e = cache_lookup(tracks[i].abspath, tracks[i].mtime);
+        if (e && e->dur > 0) {
+            tracks[i].dur = e->dur;
+            tracks[i].trackno = e->trackno;
+            tracks[i].title  = e->title  ? xstrdup(e->title)  : NULL;
+            tracks[i].artist = e->artist ? xstrdup(e->artist) : NULL;
+            tracks[i].album  = e->album  ? xstrdup(e->album)  : NULL;
+            apply_group(&tracks[i]);
+        }
     }
 
     srand((unsigned)time(NULL));
@@ -734,17 +895,24 @@ int main(int argc, char **argv) {
             continue;   /* respond to the key immediately */
         }
 
-        /* probe a small batch of *uncached* durations this tick. Cached tracks
-         * already have dur set, so they're skipped instantly. */
+        /* probe a small batch of *uncached* tracks this tick. Cached tracks
+         * already have metadata, so they're skipped instantly. */
         if (probing) {
             int probed = 0;
             while (probed < 4 && probe_idx < ntracks) {
                 if (tracks[probe_idx].dur < 0) {
-                    tracks[probe_idx].dur = probe_duration(tracks[probe_idx].path);
+                    probe_meta(&tracks[probe_idx]);
                     probed_new += (tracks[probe_idx].dur > 0);
                     probed++;
                 }
                 probe_idx++;
+            }
+            /* tags just loaded may change grouping/sort: refresh the view,
+             * keeping the highlight on the same track. */
+            if (probed > 0) {
+                int seltrack = (sel < nview) ? view[sel] : -1;
+                rebuild_view();
+                if (seltrack >= 0) select_in_view(seltrack);
             }
             if (probe_idx >= ntracks && probed_new) { save_cache(); probed_new = 0; }
         }
