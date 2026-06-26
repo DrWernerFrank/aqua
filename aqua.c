@@ -74,6 +74,24 @@ static int nview = 0;
 static char query[128] = "";
 static int qlen = 0;
 static int searching = 0;    /* 1 while typing a query */
+
+/* tabs: a flat Tracks list and an Albums browser */
+enum { TAB_TRACKS, TAB_ALBUMS };
+static int tab = TAB_TRACKS;
+static int in_album = 0;             /* 1 = drilled into an album's tracks */
+static char cur_album[256] = "";     /* the album currently opened */
+static int view_sort = 0;            /* 0 = by title, 1 = by track number */
+
+/* album list (distinct groups), and its filtered view for search */
+static char **albums = NULL;         /* points into tracks[].group (not owned) */
+static int  *album_n = NULL;         /* track count per album */
+static int   nalbums = 0;
+static int  *alview = NULL;          /* album indices matching the query */
+static int   nalview = 0;
+static int   alsel = 0;              /* selection in the album list */
+
+/* are we browsing the album list (vs a track list)? */
+static int on_album_list(void) { return tab == TAB_ALBUMS && !in_album; }
 static pid_t child = -1;     /* ffplay pid, -1 = none */
 static int paused = 0;
 static int intentional = 0;  /* we killed ffplay, don't auto-advance */
@@ -465,30 +483,101 @@ static int track_matches(const Track *t, const char *q) {
         || (t->album  && ci_contains(t->album, q));
 }
 
-/* order the view by album group, then track number, then title */
+/* order the view: by track number within an opened album, else by title */
 static int cmp_view(const void *a, const void *b) {
     const Track *ta = &tracks[*(const int *)a];
     const Track *tb = &tracks[*(const int *)b];
-    int c = strcasecmp(ta->group, tb->group);
-    if (c) return c;
-    if (ta->trackno != tb->trackno) {        /* numbered tracks first, in order */
-        if (ta->trackno == 0) return 1;
-        if (tb->trackno == 0) return -1;
-        return ta->trackno - tb->trackno;
+    if (view_sort == 1) {                    /* album view: track number order */
+        if (ta->trackno != tb->trackno) {
+            if (ta->trackno == 0) return 1;
+            if (tb->trackno == 0) return -1;
+            return ta->trackno - tb->trackno;
+        }
+        return strcasecmp(disp_title(ta), disp_title(tb));
     }
-    return strcasecmp(disp_title(ta), disp_title(tb));
+    int c = strcasecmp(disp_title(ta), disp_title(tb));   /* Tracks tab: by title */
+    if (c) return c;
+    return strcasecmp(ta->name, tb->name);
 }
 
-/* rebuild the filtered, album-grouped view from the current query */
+/* rebuild the track view: all tracks (Tracks tab) or one album's tracks
+ * (when an album is opened), filtered by the query. */
 static void rebuild_view(void) {
     if (!view) view = malloc((ntracks ? ntracks : 1) * sizeof(int));
     nview = 0;
-    for (int i = 0; i < ntracks; i++)
-        if (track_matches(&tracks[i], query)) view[nview++] = i;
+    for (int i = 0; i < ntracks; i++) {
+        if (in_album && strcasecmp(tracks[i].group, cur_album) != 0) continue;
+        if (!track_matches(&tracks[i], query)) continue;
+        view[nview++] = i;
+    }
+    view_sort = in_album ? 1 : 0;
     qsort(view, nview, sizeof(int), cmp_view);
     if (sel >= nview) sel = nview ? nview - 1 : 0;
     if (sel < 0) sel = 0;
-    build_queue();   /* the filtered list is the new play queue */
+    build_queue();   /* the visible list is the play queue */
+}
+
+/* build the distinct album list (group strings), sorted, with track counts */
+static int cmp_group_idx(const void *a, const void *b) {
+    return strcasecmp(tracks[*(const int *)a].group, tracks[*(const int *)b].group);
+}
+static void build_albums(void) {
+    static int *tmp = NULL;
+    if (!albums) {
+        albums  = malloc((ntracks ? ntracks : 1) * sizeof(char *));
+        album_n = malloc((ntracks ? ntracks : 1) * sizeof(int));
+        alview  = malloc((ntracks ? ntracks : 1) * sizeof(int));
+        tmp     = malloc((ntracks ? ntracks : 1) * sizeof(int));
+    }
+    for (int i = 0; i < ntracks; i++) tmp[i] = i;
+    qsort(tmp, ntracks, sizeof(int), cmp_group_idx);
+    nalbums = 0;
+    for (int k = 0; k < ntracks; k++) {
+        const char *g = tracks[tmp[k]].group;
+        if (nalbums == 0 || strcasecmp(g, albums[nalbums - 1]) != 0) {
+            albums[nalbums] = (char *)g; album_n[nalbums] = 1; nalbums++;
+        } else album_n[nalbums - 1]++;
+    }
+}
+
+/* filter the album list by the query into alview */
+static void rebuild_albums_view(void) {
+    nalview = 0;
+    for (int i = 0; i < nalbums; i++)
+        if (ci_contains(albums[i], query)) alview[nalview++] = i;
+    if (alsel >= nalview) alsel = nalview ? nalview - 1 : 0;
+    if (alsel < 0) alsel = 0;
+}
+
+/* apply the current query to whichever list is active */
+static void apply_query(void) {
+    if (on_album_list()) rebuild_albums_view();
+    else                 rebuild_view();
+}
+
+static void clear_query(void) { qlen = 0; query[0] = '\0'; }
+
+/* switch to a tab, resetting drill-down and any active search */
+static void switch_tab(int t) {
+    tab = t; in_album = 0; cur_album[0] = '\0';
+    searching = 0; clear_query();
+    if (tab == TAB_ALBUMS) { build_albums(); rebuild_albums_view(); alsel = 0; }
+    else rebuild_view();
+}
+
+/* open an album from the album list (ai indexes albums[]) */
+static void open_album(int ai) {
+    in_album = 1;
+    snprintf(cur_album, sizeof cur_album, "%s", albums[ai]);
+    searching = 0; clear_query(); sel = 0;
+    rebuild_view();
+}
+
+/* return from an opened album back to the album list */
+static void back_to_albums(void) {
+    in_album = 0; cur_album[0] = '\0';
+    searching = 0; clear_query();
+    build_albums(); rebuild_albums_view();
 }
 
 /* move the highlight to a given track index, if it's in the current view */
@@ -557,99 +646,88 @@ static void fmt_time(double s, char *buf, size_t n) {
 
 static int scroll_top = 0;
 
-/* render rows: a track row or an album header row. Built fresh each draw. */
-static int *rr_head = NULL;   /* 1 = header row */
-static int *rr_val  = NULL;   /* header: track idx (for group); track: view pos */
-static int  n_rr = 0;
-
-static void build_rows(void) {
-    if (!rr_head) {
-        rr_head = malloc(2 * (ntracks ? ntracks : 1) * sizeof(int));
-        rr_val  = malloc(2 * (ntracks ? ntracks : 1) * sizeof(int));
-    }
-    n_rr = 0;
-    const char *prev = NULL;
-    for (int pos = 0; pos < nview; pos++) {
-        int ti = view[pos];
-        const char *g = tracks[ti].group;
-        if (!prev || strcasecmp(g, prev) != 0) {
-            rr_head[n_rr] = 1; rr_val[n_rr] = ti; n_rr++;
-            prev = g;
-        }
-        rr_head[n_rr] = 0; rr_val[n_rr] = pos; n_rr++;
-    }
-}
-
 static void draw(void) {
     int rows, cols;
     get_size(&rows, &cols);
     if (cols > 200) cols = 200;
 
-    int header = 2;        /* title + blank */
+    int header = 2;        /* tab bar + breadcrumb/search */
     int footer = 5;        /* divider, nowtitle, bar, help, pad */
     int list_h = rows - header - footer;
     if (list_h < 1) list_h = 1;
 
-    build_rows();
+    int album_list = on_album_list();
+    int asel   = album_list ? alsel   : sel;     /* active selection */
+    int acount = album_list ? nalview : nview;   /* active list length */
 
-    /* find the render row holding the current selection */
-    int selrow = 0;
-    for (int r = 0; r < n_rr; r++)
-        if (!rr_head[r] && rr_val[r] == sel) { selrow = r; break; }
-
-    /* keep selection (and its header just above) on screen */
-    if (selrow - 1 < scroll_top) scroll_top = selrow - 1;
-    if (selrow >= scroll_top + list_h) scroll_top = selrow - list_h + 1;
+    /* keep the active selection on screen */
+    if (asel < scroll_top) scroll_top = asel;
+    if (asel >= scroll_top + list_h) scroll_top = asel - list_h + 1;
     if (scroll_top < 0) scroll_top = 0;
 
     char out[1 << 16];
     int o = 0;
     o += snprintf(out + o, sizeof out - o, "\033[H");   /* home */
 
-    /* header: show filtered count when a query is active */
-    if (query[0])
-        o += snprintf(out + o, sizeof out - o,
-            AQUA_B "  \xE2\x99\xAC AQUA" RESET GRAY "   %d/%d tracks" RESET "\033[K\r\n",
-            nview, ntracks);
-    else
-        o += snprintf(out + o, sizeof out - o,
-            AQUA_B "  \xE2\x99\xAC AQUA" RESET GRAY "   %d tracks" RESET "\033[K\r\n",
-            ntracks);
+    /* ---- tab bar ---- */
+    const char *t_tracks = (tab == TAB_TRACKS) ? INVAQ " Tracks " RESET : DGRAY " Tracks " RESET;
+    const char *t_albums = (tab == TAB_ALBUMS) ? INVAQ " Albums " RESET : DGRAY " Albums " RESET;
+    o += snprintf(out + o, sizeof out - o,
+        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s" "\033[K\r\n", t_tracks, t_albums);
 
-    /* search bar (when typing) or filter indicator */
+    /* ---- breadcrumb / search line ---- */
     if (searching)
         o += snprintf(out + o, sizeof out - o,
-            "  " AQUA "/" WHITE "%s" AQUA "\xE2\x96\x88" RESET "\033[K\r\n", query);
+            "  " AQUA "/" WHITE "%s" AQUA "\xE2\x96\x88" RESET
+            DGRAY "   %d matches" RESET "\033[K\r\n", query, acount);
+    else if (in_album)
+        o += snprintf(out + o, sizeof out - o,
+            "  " DGRAY "Albums \xE2\x96\xB8 " AQUA "%s" DGRAY
+            "   %d tracks  (esc: back)" RESET "\033[K\r\n", cur_album, nview);
     else if (query[0])
         o += snprintf(out + o, sizeof out - o,
             "  " DGRAY "filter: " AQUA "%s" DGRAY "  (esc to clear)" RESET "\033[K\r\n", query);
+    else if (album_list)
+        o += snprintf(out + o, sizeof out - o,
+            "  " DGRAY "%d albums" RESET "\033[K\r\n", nalbums);
     else
-        o += snprintf(out + o, sizeof out - o, "\033[K\r\n");
+        o += snprintf(out + o, sizeof out - o,
+            "  " DGRAY "%d tracks" RESET "\033[K\r\n", ntracks);
 
-    /* list (render rows: album headers + tracks) */
+    /* ---- list body ---- */
     for (int i = 0; i < list_h; i++) {
         int r = scroll_top + i;
         o += snprintf(out + o, sizeof out - o, "\033[K");
-        if (r >= n_rr) {
-            if (n_rr == 0 && i == 0)
+        if (r >= acount) {
+            if (acount == 0 && i == 0)
                 o += snprintf(out + o, sizeof out - o,
                     "  " DGRAY "%s" RESET "\r\n",
-                    ntracks ? "No matches." : "No tracks.");
+                    query[0] ? "No matches." : (album_list ? "No albums." : "No tracks."));
             else
                 o += snprintf(out + o, sizeof out - o, "\r\n");
             continue;
         }
 
-        if (rr_head[r]) {                       /* album / folder header */
-            const char *g = tracks[rr_val[r]].group;
-            int gw = cols - 4;
-            o += snprintf(out + o, sizeof out - o,
-                " " AQUA_B "\xE2\x96\x8C %-*.*s" RESET "\r\n", gw, gw, *g ? g : "(unknown)");
+        if (album_list) {                        /* ---- album row ---- */
+            int ai = alview[r];
+            const char *an = albums[ai];
+            char cbuf[24];
+            snprintf(cbuf, sizeof cbuf, "%d \xE2\x99\xAA", album_n[ai]);
+            int nw = cols - 12;
+            if (nw < 8) nw = 8;
+            if (r == alsel)
+                o += snprintf(out + o, sizeof out - o,
+                    INVAQ " %-*.*s %6s " RESET "\r\n",
+                    nw, nw, *an ? an : "(unknown)", cbuf);
+            else
+                o += snprintf(out + o, sizeof out - o,
+                    " " WHITE "%-*.*s" RESET " " DGRAY "%6s" RESET "\r\n",
+                    nw, nw, *an ? an : "(unknown)", cbuf);
             continue;
         }
 
-        int vidx = rr_val[r];
-        int idx = view[vidx];
+        /* ---- track row ---- */
+        int idx = view[r];
         Track *t = &tracks[idx];
         char dbuf[16];
         fmt_time(t->dur, dbuf, sizeof dbuf);
@@ -663,7 +741,7 @@ static void draw(void) {
         if (name_w < 8) name_w = 8;
         const char *title = disp_title(t);
 
-        if (vidx == sel) {
+        if (r == sel) {
             o += snprintf(out + o, sizeof out - o,
                 INVAQ " %s%s %-*.*s %5s " RESET "\r\n",
                 marker, num, name_w, name_w, title, dbuf);
@@ -719,15 +797,20 @@ static void draw(void) {
         o += snprintf(out + o, sizeof out - o,
             "  " DGRAY "type to filter   " DGRAY "\xE2\x86\xB5" GRAY " keep  "
             DGRAY "esc" GRAY " clear  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move" RESET "\033[K");
+    else if (on_album_list())
+        o += snprintf(out + o, sizeof out - o,
+            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " open album  "
+            DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "/" GRAY " search  " DGRAY "q" GRAY " quit" RESET "\033[K");
     else
         o += snprintf(out + o, sizeof out - o,
-            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5/space" GRAY " play/pause  "
+            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5/space" GRAY " play  "
             DGRAY "n/b" GRAY " next/prev  " DGRAY "\xE2\x86\x90\xE2\x86\x92" GRAY " seek  "
-            DGRAY "-/+" GRAY " vol %d%%  " DGRAY "/" GRAY " search  " DGRAY "s" GRAY " shuffle%s  "
-            DGRAY "r" GRAY " repeat%s  " DGRAY "q" GRAY " quit" RESET "\033[K",
+            DGRAY "-/+" GRAY " vol %d%%  " DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "/" GRAY " search  "
+            DGRAY "s" GRAY " shuf%s  " DGRAY "r" GRAY " rep%s  " "%s" DGRAY "q" GRAY " quit" RESET "\033[K",
             volume,
             shuffle ? AQUA " on" GRAY : "",
-            repeat  ? AQUA " on" GRAY : "");
+            repeat  ? AQUA " on" GRAY : "",
+            in_album ? DGRAY "esc" GRAY " back  " : "");
 
     o += snprintf(out + o, sizeof out - o, "\033[J");   /* clear below */
 
@@ -797,6 +880,7 @@ int main(int argc, char **argv) {
     queue = malloc(ntracks * sizeof(int));
     if (!queue) { perror("malloc"); return 1; }
     rebuild_view();   /* initial view = all tracks; also builds the queue */
+    build_albums();   /* album list for the Albums tab */
 
     have_pactl = (system("command -v pactl >/dev/null 2>&1") == 0);
 
@@ -841,30 +925,49 @@ int main(int argc, char **argv) {
 
         if (rv > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
             int k = read_key();
+            int alist = on_album_list();
             if (searching) {
-                /* ---- search input mode ---- */
+                /* ---- search input mode (filters the active list) ---- */
                 switch (k) {
-                    case 1000: if (sel > 0) sel--; break;            /* up */
-                    case 1001: if (sel < nview - 1) sel++; break;    /* down */
+                    case 1000: if (alist) { if (alsel > 0) alsel--; }
+                               else      { if (sel > 0) sel--; } break;
+                    case 1001: if (alist) { if (alsel < nalview - 1) alsel++; }
+                               else      { if (sel < nview - 1) sel++; } break;
                     case '\r': case '\n':
                         searching = 0;                               /* keep filter */
-                        if (nview > 0) play_track(view[sel], 0);
+                        if (alist) { if (nalview > 0) open_album(alview[alsel]); }
+                        else if (nview > 0) play_track(view[sel], 0);
                         break;
                     case '\033':                                     /* esc: clear */
-                        searching = 0; qlen = 0; query[0] = '\0'; rebuild_view();
+                        searching = 0; clear_query(); apply_query();
                         break;
                     case 127: case 8:                                /* backspace */
-                        if (qlen > 0) { query[--qlen] = '\0'; rebuild_view(); }
+                        if (qlen > 0) { query[--qlen] = '\0'; apply_query(); }
                         break;
                     default:
                         if (k >= 32 && k < 127 && qlen < (int)sizeof(query) - 1) {
                             query[qlen++] = (char)k; query[qlen] = '\0';
-                            rebuild_view();
+                            apply_query();
                         }
                         break;
                 }
+            } else if (alist) {
+                /* ---- album list ---- */
+                switch (k) {
+                    case 1000: case 'k': if (alsel > 0) alsel--; break;
+                    case 1001: case 'j': if (alsel < nalview - 1) alsel++; break;
+                    case '\r': case '\n': case 1002: /* enter / right -> open */
+                        if (nalview > 0) open_album(alview[alsel]);
+                        break;
+                    case '\t': switch_tab(TAB_TRACKS); break;
+                    case '/': searching = 1; break;
+                    case '\033': if (query[0]) { clear_query(); rebuild_albums_view(); } break;
+                    case 'g': alsel = 0; break;
+                    case 'G': alsel = nalview ? nalview - 1 : 0; break;
+                    case 'q': case 3: running = 0; break;
+                }
             } else {
-                /* ---- normal mode ---- */
+                /* ---- track list (Tracks tab or an opened album) ---- */
                 switch (k) {
                     case 1000: case 'k': if (sel > 0) sel--; break;
                     case 1001: case 'j': if (sel < nview - 1) sel++; break;
@@ -881,9 +984,11 @@ int main(int argc, char **argv) {
                     case '+': case '=': set_volume(5); break;
                     case 'r': repeat = !repeat; break;
                     case 's': shuffle = !shuffle; build_queue(); break;
+                    case '\t': switch_tab(tab == TAB_TRACKS ? TAB_ALBUMS : TAB_TRACKS); break;
                     case '/': searching = 1; break;
-                    case '\033':                  /* esc clears an active filter */
-                        if (query[0]) { qlen = 0; query[0] = '\0'; rebuild_view(); }
+                    case '\033':                  /* esc: clear filter, else leave album */
+                        if (query[0]) { clear_query(); rebuild_view(); }
+                        else if (in_album) back_to_albums();
                         break;
                     case 'g': sel = 0; break;
                     case 'G': sel = nview ? nview - 1 : 0; break;
@@ -907,12 +1012,16 @@ int main(int argc, char **argv) {
                 }
                 probe_idx++;
             }
-            /* tags just loaded may change grouping/sort: refresh the view,
-             * keeping the highlight on the same track. */
+            /* tags just loaded may change albums/grouping: refresh lists,
+             * keeping the track-list highlight on the same track. */
             if (probed > 0) {
-                int seltrack = (sel < nview) ? view[sel] : -1;
-                rebuild_view();
-                if (seltrack >= 0) select_in_view(seltrack);
+                build_albums();
+                if (on_album_list()) rebuild_albums_view();
+                else {
+                    int seltrack = (sel < nview) ? view[sel] : -1;
+                    rebuild_view();
+                    if (seltrack >= 0) select_in_view(seltrack);
+                }
             }
             if (probe_idx >= ntracks && probed_new) { save_cache(); probed_new = 0; }
         }

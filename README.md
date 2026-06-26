@@ -19,8 +19,10 @@ Minimal aqua/black/gray interface, no animations.
 ## Features
 
 - Recursively scans a folder for audio (`mp3 flac ogg wav m4a aac opus wma ...`)
-- **Reads tags** (title, artist, album, track number) and **groups the list by
-  album** — falling back to the containing folder when a track has no album tag
+- **Reads tags** (title, artist, album, track number)
+- **Tracks / Albums tabs** (`Tab` to switch): a flat track list, plus an Albums
+  browser — open an album to see its tracks in track-number order. Untagged
+  files fall back to their containing folder name as the album
 - Play / pause (true pause via `SIGSTOP`/`SIGCONT`), next / previous, seek
 - **Gapless volume** — adjusts the live PulseAudio stream, no restart
 - **Shuffle** and **repeat**
@@ -68,11 +70,20 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 | `n` / `b`      | next / previous         |
 | `←` / `→`      | seek −5s / +5s          |
 | `-` / `+`      | volume down / up        |
-| `/`            | search / filter tracks  |
+| `/`            | search / filter         |
+| `Tab`          | switch Tracks / Albums  |
 | `s`            | toggle shuffle          |
 | `r`            | toggle repeat (playlist)|
 | `g` / `G`      | jump to top / bottom    |
 | `q`            | quit                    |
+
+### Tabs
+
+`Tab` switches between the **Tracks** tab (a flat list of every track) and the
+**Albums** tab. In the Albums tab, `↑↓` move between albums and `Enter` (or `→`)
+opens one to show its tracks in track-number order; `Esc` goes back to the album
+list. Playing from inside an album makes that album the queue, so next/prev stay
+within it.
 
 ### Search
 
