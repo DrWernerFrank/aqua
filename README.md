@@ -74,7 +74,7 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 | `/`            | search / filter         |
 | `Tab`          | cycle Tracks/Albums/Artists |
 | `s`            | toggle shuffle          |
-| `r`            | toggle repeat (playlist)|
+| `r`            | repeat: off / all / one |
 | `g` / `G`      | jump to top / bottom    |
 | `q`            | quit                    |
 

@@ -109,7 +109,8 @@ static pid_t child = -1;     /* ffplay pid, -1 = none */
 static int paused = 0;
 static int intentional = 0;  /* we killed ffplay, don't auto-advance */
 static int volume = 100;
-static int repeat = 0;       /* loop playlist */
+enum { REP_OFF, REP_ALL, REP_ONE };
+static int repeat = REP_OFF; /* off / repeat-all (loop queue) / repeat-one (track) */
 static int have_pactl = 0;   /* set if PulseAudio's pactl is available */
 static int shuffle = 0;      /* random play order */
 
@@ -616,7 +617,7 @@ static void next_track(void) {
     if (nqueue == 0) return;
     int p = queue_pos(cur);                 /* -1 if current isn't in the queue */
     int pos = p + 1;                        /* p<0 -> start at 0 */
-    if (pos >= nqueue) { if (!repeat) { stop_child(); cur = -1; return; } pos = 0; }
+    if (pos >= nqueue) { if (repeat == REP_OFF) { stop_child(); cur = -1; return; } pos = 0; }
     play_track(queue[pos], 0);
     select_in_view(queue[pos]);
 }
@@ -625,7 +626,7 @@ static void prev_track(void) {
     if (nqueue == 0) return;
     if (elapsed() > 3) { play_track(cur, 0); return; }
     int p = queue_pos(cur);
-    int pos = (p > 0) ? p - 1 : (repeat ? nqueue - 1 : 0);
+    int pos = (p > 0) ? p - 1 : (repeat != REP_OFF ? nqueue - 1 : 0);
     play_track(queue[pos], 0);
     select_in_view(queue[pos]);
 }
@@ -839,7 +840,7 @@ static void draw(void) {
             DGRAY "s" GRAY " shuf%s  " DGRAY "r" GRAY " rep%s  " "%s" DGRAY "q" GRAY " quit" RESET "\033[K",
             volume,
             shuffle ? AQUA " on" GRAY : "",
-            repeat  ? AQUA " on" GRAY : "",
+            repeat == REP_ALL ? AQUA " all" GRAY : repeat == REP_ONE ? AQUA " one" GRAY : "",
             in_album ? DGRAY "esc" GRAY " back  " : "");
 
     o += snprintf(out + o, sizeof out - o, "\033[J");   /* clear below */
@@ -937,7 +938,10 @@ int main(int argc, char **argv) {
             pid_t r = waitpid(child, &st, WNOHANG);
             if (r == child) {
                 child = -1;
-                if (!intentional) next_track();
+                if (!intentional) {
+                    if (repeat == REP_ONE && cur >= 0) play_track(cur, 0);
+                    else next_track();
+                }
             }
         }
 
@@ -1012,7 +1016,7 @@ int main(int argc, char **argv) {
                     case 1003: seek(-5); break;   /* left */
                     case '-': case '_': set_volume(-5); break;
                     case '+': case '=': set_volume(5); break;
-                    case 'r': repeat = !repeat; break;
+                    case 'r': repeat = (repeat + 1) % 3; break;
                     case 's': shuffle = !shuffle; build_queue(); break;
                     case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
                     case '/': searching = 1; break;
