@@ -1,0 +1,9 @@
+# compiled binary
+/aqua
+
+# objects
+*.o
+
+# editor / local tooling
+.claude/
+*.swp
