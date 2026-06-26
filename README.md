@@ -20,9 +20,10 @@ Minimal aqua/black/gray interface, no animations.
 
 - Recursively scans a folder for audio (`mp3 flac ogg wav m4a aac opus wma ...`)
 - **Reads tags** (title, artist, album, track number)
-- **Tracks / Albums tabs** (`Tab` to switch): a flat track list, plus an Albums
-  browser — open an album to see its tracks in track-number order. Untagged
-  files fall back to their containing folder name as the album
+- **Tracks / Albums / Artists tabs** (`Tab` to cycle): a flat track list, an
+  Albums browser (open an album to see its tracks in track-number order), and an
+  Artists browser (open an artist to see their tracks by album then track).
+  Untagged files fall back to their containing folder name as the album
 - Play / pause (true pause via `SIGSTOP`/`SIGCONT`), next / previous, seek
 - **Gapless volume** — adjusts the live PulseAudio stream, no restart
 - **Shuffle** and **repeat**
@@ -71,7 +72,7 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 | `←` / `→`      | seek −5s / +5s          |
 | `-` / `+`      | volume down / up        |
 | `/`            | search / filter         |
-| `Tab`          | switch Tracks / Albums  |
+| `Tab`          | cycle Tracks/Albums/Artists |
 | `s`            | toggle shuffle          |
 | `r`            | toggle repeat (playlist)|
 | `g` / `G`      | jump to top / bottom    |
@@ -79,11 +80,12 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 
 ### Tabs
 
-`Tab` switches between the **Tracks** tab (a flat list of every track) and the
-**Albums** tab. In the Albums tab, `↑↓` move between albums and `Enter` (or `→`)
-opens one to show its tracks in track-number order; `Esc` goes back to the album
-list. Playing from inside an album makes that album the queue, so next/prev stay
-within it.
+`Tab` cycles between **Tracks** (a flat list of every track), **Albums**, and
+**Artists**. In the Albums/Artists tabs, `↑↓` move between entries and `Enter`
+(or `→`) opens one — an album shows its tracks in track-number order, an artist
+shows their tracks grouped by album then track. `Esc` goes back to the list.
+Opening an album or artist makes that selection the queue, so next/prev stay
+within it. `/` filters the album/artist list while browsing, tracks otherwise.
 
 ### Search
 

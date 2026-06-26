@@ -75,8 +75,8 @@ static char query[128] = "";
 static int qlen = 0;
 static int searching = 0;    /* 1 while typing a query */
 
-/* tabs: a flat Tracks list and an Albums browser */
-enum { TAB_TRACKS, TAB_ALBUMS };
+/* tabs: a flat Tracks list, plus Albums and Artists browsers */
+enum { TAB_TRACKS, TAB_ALBUMS, TAB_ARTISTS, TAB_COUNT };
 static int tab = TAB_TRACKS;
 static int in_album = 0;             /* 1 = drilled into an album's tracks */
 static char cur_album[256] = "";     /* the album currently opened */
@@ -90,8 +90,21 @@ static int  *alview = NULL;          /* album indices matching the query */
 static int   nalview = 0;
 static int   alsel = 0;              /* selection in the album list */
 
-/* are we browsing the album list (vs a track list)? */
-static int on_album_list(void) { return tab == TAB_ALBUMS && !in_album; }
+/* are we browsing a group list (albums/artists) vs a track list? */
+static int on_album_list(void) {
+    return (tab == TAB_ALBUMS || tab == TAB_ARTISTS) && !in_album;
+}
+
+/* the string a track is grouped by in the current browse tab */
+static const char *browse_key(const Track *t) {
+    if (tab == TAB_ARTISTS) return (t->artist && *t->artist) ? t->artist : "(unknown)";
+    return t->group;   /* albums (album tag, else folder) */
+}
+
+/* label for the active browse tab */
+static const char *browse_label(void) {
+    return tab == TAB_ARTISTS ? "Artists" : "Albums";
+}
 static pid_t child = -1;     /* ffplay pid, -1 = none */
 static int paused = 0;
 static int intentional = 0;  /* we killed ffplay, don't auto-advance */
@@ -483,17 +496,28 @@ static int track_matches(const Track *t, const char *q) {
         || (t->album  && ci_contains(t->album, q));
 }
 
-/* order the view: by track number within an opened album, else by title */
+/* compare two tracks by (track number, then title) */
+static int cmp_by_trackno(const Track *ta, const Track *tb) {
+    if (ta->trackno != tb->trackno) {
+        if (ta->trackno == 0) return 1;
+        if (tb->trackno == 0) return -1;
+        return ta->trackno - tb->trackno;
+    }
+    return strcasecmp(disp_title(ta), disp_title(tb));
+}
+
+/* order the view depending on context:
+ *   0 = by title (Tracks tab)
+ *   1 = by track number (opened album)
+ *   2 = by album, then track number (opened artist) */
 static int cmp_view(const void *a, const void *b) {
     const Track *ta = &tracks[*(const int *)a];
     const Track *tb = &tracks[*(const int *)b];
-    if (view_sort == 1) {                    /* album view: track number order */
-        if (ta->trackno != tb->trackno) {
-            if (ta->trackno == 0) return 1;
-            if (tb->trackno == 0) return -1;
-            return ta->trackno - tb->trackno;
-        }
-        return strcasecmp(disp_title(ta), disp_title(tb));
+    if (view_sort == 1) return cmp_by_trackno(ta, tb);
+    if (view_sort == 2) {
+        int c = strcasecmp(ta->group, tb->group);
+        if (c) return c;
+        return cmp_by_trackno(ta, tb);
     }
     int c = strcasecmp(disp_title(ta), disp_title(tb));   /* Tracks tab: by title */
     if (c) return c;
@@ -506,20 +530,22 @@ static void rebuild_view(void) {
     if (!view) view = malloc((ntracks ? ntracks : 1) * sizeof(int));
     nview = 0;
     for (int i = 0; i < ntracks; i++) {
-        if (in_album && strcasecmp(tracks[i].group, cur_album) != 0) continue;
+        if (in_album && strcasecmp(browse_key(&tracks[i]), cur_album) != 0) continue;
         if (!track_matches(&tracks[i], query)) continue;
         view[nview++] = i;
     }
-    view_sort = in_album ? 1 : 0;
+    /* opened album -> by track no; opened artist -> by album then track no */
+    view_sort = !in_album ? 0 : (tab == TAB_ARTISTS ? 2 : 1);
     qsort(view, nview, sizeof(int), cmp_view);
     if (sel >= nview) sel = nview ? nview - 1 : 0;
     if (sel < 0) sel = 0;
     build_queue();   /* the visible list is the play queue */
 }
 
-/* build the distinct album list (group strings), sorted, with track counts */
+/* build the distinct browse list (albums or artists), sorted, with counts */
 static int cmp_group_idx(const void *a, const void *b) {
-    return strcasecmp(tracks[*(const int *)a].group, tracks[*(const int *)b].group);
+    return strcasecmp(browse_key(&tracks[*(const int *)a]),
+                      browse_key(&tracks[*(const int *)b]));
 }
 static void build_albums(void) {
     static int *tmp = NULL;
@@ -533,7 +559,7 @@ static void build_albums(void) {
     qsort(tmp, ntracks, sizeof(int), cmp_group_idx);
     nalbums = 0;
     for (int k = 0; k < ntracks; k++) {
-        const char *g = tracks[tmp[k]].group;
+        const char *g = browse_key(&tracks[tmp[k]]);
         if (nalbums == 0 || strcasecmp(g, albums[nalbums - 1]) != 0) {
             albums[nalbums] = (char *)g; album_n[nalbums] = 1; nalbums++;
         } else album_n[nalbums - 1]++;
@@ -561,8 +587,8 @@ static void clear_query(void) { qlen = 0; query[0] = '\0'; }
 static void switch_tab(int t) {
     tab = t; in_album = 0; cur_album[0] = '\0';
     searching = 0; clear_query();
-    if (tab == TAB_ALBUMS) { build_albums(); rebuild_albums_view(); alsel = 0; }
-    else rebuild_view();
+    if (tab == TAB_TRACKS) rebuild_view();
+    else { build_albums(); rebuild_albums_view(); alsel = 0; }
 }
 
 /* open an album from the album list (ai indexes albums[]) */
@@ -670,10 +696,11 @@ static void draw(void) {
     o += snprintf(out + o, sizeof out - o, "\033[H");   /* home */
 
     /* ---- tab bar ---- */
-    const char *t_tracks = (tab == TAB_TRACKS) ? INVAQ " Tracks " RESET : DGRAY " Tracks " RESET;
-    const char *t_albums = (tab == TAB_ALBUMS) ? INVAQ " Albums " RESET : DGRAY " Albums " RESET;
+    const char *t_tracks  = (tab == TAB_TRACKS)  ? INVAQ " Tracks "  RESET : DGRAY " Tracks "  RESET;
+    const char *t_albums  = (tab == TAB_ALBUMS)  ? INVAQ " Albums "  RESET : DGRAY " Albums "  RESET;
+    const char *t_artists = (tab == TAB_ARTISTS) ? INVAQ " Artists " RESET : DGRAY " Artists " RESET;
     o += snprintf(out + o, sizeof out - o,
-        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s" "\033[K\r\n", t_tracks, t_albums);
+        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s" "\033[K\r\n", t_tracks, t_albums, t_artists);
 
     /* ---- breadcrumb / search line ---- */
     if (searching)
@@ -682,14 +709,15 @@ static void draw(void) {
             DGRAY "   %d matches" RESET "\033[K\r\n", query, acount);
     else if (in_album)
         o += snprintf(out + o, sizeof out - o,
-            "  " DGRAY "Albums \xE2\x96\xB8 " AQUA "%s" DGRAY
-            "   %d tracks  (esc: back)" RESET "\033[K\r\n", cur_album, nview);
+            "  " DGRAY "%s \xE2\x96\xB8 " AQUA "%s" DGRAY
+            "   %d tracks  (esc: back)" RESET "\033[K\r\n", browse_label(), cur_album, nview);
     else if (query[0])
         o += snprintf(out + o, sizeof out - o,
             "  " DGRAY "filter: " AQUA "%s" DGRAY "  (esc to clear)" RESET "\033[K\r\n", query);
     else if (album_list)
         o += snprintf(out + o, sizeof out - o,
-            "  " DGRAY "%d albums" RESET "\033[K\r\n", nalbums);
+            "  " DGRAY "%d %s" RESET "\033[K\r\n",
+            nalbums, tab == TAB_ARTISTS ? "artists" : "albums");
     else
         o += snprintf(out + o, sizeof out - o,
             "  " DGRAY "%d tracks" RESET "\033[K\r\n", ntracks);
@@ -702,7 +730,9 @@ static void draw(void) {
             if (acount == 0 && i == 0)
                 o += snprintf(out + o, sizeof out - o,
                     "  " DGRAY "%s" RESET "\r\n",
-                    query[0] ? "No matches." : (album_list ? "No albums." : "No tracks."));
+                    query[0] ? "No matches." :
+                    (album_list ? (tab == TAB_ARTISTS ? "No artists." : "No albums.")
+                                : "No tracks."));
             else
                 o += snprintf(out + o, sizeof out - o, "\r\n");
             continue;
@@ -799,7 +829,7 @@ static void draw(void) {
             DGRAY "esc" GRAY " clear  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move" RESET "\033[K");
     else if (on_album_list())
         o += snprintf(out + o, sizeof out - o,
-            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " open album  "
+            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " open  "
             DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "/" GRAY " search  " DGRAY "q" GRAY " quit" RESET "\033[K");
     else
         o += snprintf(out + o, sizeof out - o,
@@ -959,7 +989,7 @@ int main(int argc, char **argv) {
                     case '\r': case '\n': case 1002: /* enter / right -> open */
                         if (nalview > 0) open_album(alview[alsel]);
                         break;
-                    case '\t': switch_tab(TAB_TRACKS); break;
+                    case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
                     case '/': searching = 1; break;
                     case '\033': if (query[0]) { clear_query(); rebuild_albums_view(); } break;
                     case 'g': alsel = 0; break;
@@ -984,7 +1014,7 @@ int main(int argc, char **argv) {
                     case '+': case '=': set_volume(5); break;
                     case 'r': repeat = !repeat; break;
                     case 's': shuffle = !shuffle; build_queue(); break;
-                    case '\t': switch_tab(tab == TAB_TRACKS ? TAB_ALBUMS : TAB_TRACKS); break;
+                    case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
                     case '/': searching = 1; break;
                     case '\033':                  /* esc: clear filter, else leave album */
                         if (query[0]) { clear_query(); rebuild_view(); }
