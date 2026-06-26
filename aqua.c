@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <ctype.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -52,8 +53,15 @@ typedef struct {
 static Track *tracks = NULL;
 static int ntracks = 0, capacity = 0;
 
-static int sel = 0;          /* highlighted row */
+static int sel = 0;          /* highlighted row (index into view[]) */
 static int cur = -1;         /* currently loaded track, -1 = none */
+
+/* search/filter: view[] holds the track indices matching `query` */
+static int *view = NULL;
+static int nview = 0;
+static char query[128] = "";
+static int qlen = 0;
+static int searching = 0;    /* 1 while typing a query */
 static pid_t child = -1;     /* ffplay pid, -1 = none */
 static int paused = 0;
 static int intentional = 0;  /* we killed ffplay, don't auto-advance */
@@ -351,12 +359,42 @@ static void build_order(void) {
     }
 }
 
+/* case-insensitive substring match */
+static int ci_contains(const char *hay, const char *needle) {
+    if (!*needle) return 1;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+            i++;
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+
+/* rebuild the filtered view from the current query */
+static void rebuild_view(void) {
+    if (!view) view = malloc((ntracks ? ntracks : 1) * sizeof(int));
+    nview = 0;
+    for (int i = 0; i < ntracks; i++)
+        if (ci_contains(tracks[i].name, query)) view[nview++] = i;
+    if (sel >= nview) sel = nview ? nview - 1 : 0;
+    if (sel < 0) sel = 0;
+}
+
+/* move the highlight to a given track index, if it's in the current view */
+static void select_in_view(int track) {
+    for (int i = 0; i < nview; i++)
+        if (view[i] == track) { sel = i; return; }
+}
+
 static void next_track(void) {
     if (ntracks == 0) return;
     int pos = (cur >= 0) ? order_pos(cur) + 1 : 0;
     if (pos >= ntracks) { if (!repeat) { stop_child(); cur = -1; return; } pos = 0; }
     play_track(order[pos], 0);
-    sel = order[pos];
+    select_in_view(order[pos]);
 }
 
 static void prev_track(void) {
@@ -365,7 +403,7 @@ static void prev_track(void) {
     int pos = (cur >= 0) ? order_pos(cur) - 1 : 0;
     if (pos < 0) pos = repeat ? ntracks - 1 : 0;
     play_track(order[pos], 0);
-    sel = order[pos];
+    select_in_view(order[pos]);
 }
 
 static void seek(double delta) {
@@ -429,17 +467,40 @@ static void draw(void) {
     int o = 0;
     o += snprintf(out + o, sizeof out - o, "\033[H");   /* home */
 
-    /* header */
-    o += snprintf(out + o, sizeof out - o,
-        AQUA_B "  \xE2\x99\xAC AQUA" RESET GRAY "   %d tracks" RESET "\033[K\r\n",
-        ntracks);
-    o += snprintf(out + o, sizeof out - o, "\033[K\r\n");
+    /* header: show filtered count when a query is active */
+    if (query[0])
+        o += snprintf(out + o, sizeof out - o,
+            AQUA_B "  \xE2\x99\xAC AQUA" RESET GRAY "   %d/%d tracks" RESET "\033[K\r\n",
+            nview, ntracks);
+    else
+        o += snprintf(out + o, sizeof out - o,
+            AQUA_B "  \xE2\x99\xAC AQUA" RESET GRAY "   %d tracks" RESET "\033[K\r\n",
+            ntracks);
 
-    /* list */
+    /* search bar (when typing) or filter indicator */
+    if (searching)
+        o += snprintf(out + o, sizeof out - o,
+            "  " AQUA "/" WHITE "%s" AQUA "\xE2\x96\x88" RESET "\033[K\r\n", query);
+    else if (query[0])
+        o += snprintf(out + o, sizeof out - o,
+            "  " DGRAY "filter: " AQUA "%s" DGRAY "  (esc to clear)" RESET "\033[K\r\n", query);
+    else
+        o += snprintf(out + o, sizeof out - o, "\033[K\r\n");
+
+    /* list (over the filtered view) */
     for (int i = 0; i < list_h; i++) {
-        int idx = scroll_top + i;
+        int vidx = scroll_top + i;
         o += snprintf(out + o, sizeof out - o, "\033[K");
-        if (idx >= ntracks) { o += snprintf(out + o, sizeof out - o, "\r\n"); continue; }
+        if (vidx >= nview) {
+            if (nview == 0 && i == 0)
+                o += snprintf(out + o, sizeof out - o,
+                    "  " DGRAY "%s" RESET "\r\n",
+                    ntracks ? "No matches." : "No tracks.");
+            else
+                o += snprintf(out + o, sizeof out - o, "\r\n");
+            continue;
+        }
+        int idx = view[vidx];
         Track *t = &tracks[idx];
         char dbuf[16];
         fmt_time(t->dur, dbuf, sizeof dbuf);
@@ -448,7 +509,7 @@ static void draw(void) {
         int name_w = cols - 12;
         if (name_w < 10) name_w = 10;
 
-        if (idx == sel) {
+        if (vidx == sel) {
             o += snprintf(out + o, sizeof out - o,
                 INVAQ " %s%-*.*s %5s " RESET "\r\n",
                 marker, name_w, name_w, t->name, dbuf);
@@ -493,14 +554,19 @@ static void draw(void) {
     }
 
     /* help line */
-    o += snprintf(out + o, sizeof out - o,
-        "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5/space" GRAY " play/pause  "
-        DGRAY "n/b" GRAY " next/prev  " DGRAY "\xE2\x86\x90\xE2\x86\x92" GRAY " seek  "
-        DGRAY "-/+" GRAY " vol %d%%  " DGRAY "s" GRAY " shuffle%s  " DGRAY "r" GRAY " repeat%s  "
-        DGRAY "q" GRAY " quit" RESET "\033[K",
-        volume,
-        shuffle ? AQUA " on" GRAY : "",
-        repeat  ? AQUA " on" GRAY : "");
+    if (searching)
+        o += snprintf(out + o, sizeof out - o,
+            "  " DGRAY "type to filter   " DGRAY "\xE2\x86\xB5" GRAY " keep  "
+            DGRAY "esc" GRAY " clear  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move" RESET "\033[K");
+    else
+        o += snprintf(out + o, sizeof out - o,
+            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5/space" GRAY " play/pause  "
+            DGRAY "n/b" GRAY " next/prev  " DGRAY "\xE2\x86\x90\xE2\x86\x92" GRAY " seek  "
+            DGRAY "-/+" GRAY " vol %d%%  " DGRAY "/" GRAY " search  " DGRAY "s" GRAY " shuffle%s  "
+            DGRAY "r" GRAY " repeat%s  " DGRAY "q" GRAY " quit" RESET "\033[K",
+            volume,
+            shuffle ? AQUA " on" GRAY : "",
+            repeat  ? AQUA " on" GRAY : "");
 
     o += snprintf(out + o, sizeof out - o, "\033[J");   /* clear below */
 
@@ -509,24 +575,27 @@ static void draw(void) {
 
 /* ---- input ---- */
 static int read_key(void) {
-    char c;
+    static int pending = -1;            /* one-byte pushback */
+    if (pending >= 0) { int p = pending; pending = -1; return p; }
+
+    unsigned char c;
     int n = read(STDIN_FILENO, &c, 1);
     if (n <= 0) return -1;
     if (c == '\033') {
-        char seq[2];
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\033';
-        if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\033';
-        if (seq[0] == '[') {
-            switch (seq[1]) {
-                case 'A': return 1000; /* up */
-                case 'B': return 1001; /* down */
-                case 'C': return 1002; /* right */
-                case 'D': return 1003; /* left */
-            }
+        unsigned char s0;
+        if (read(STDIN_FILENO, &s0, 1) != 1) return '\033';   /* lone Esc */
+        if (s0 != '[') { pending = s0; return '\033'; }       /* Esc + other key */
+        unsigned char s1;
+        if (read(STDIN_FILENO, &s1, 1) != 1) return '\033';
+        switch (s1) {
+            case 'A': return 1000; /* up */
+            case 'B': return 1001; /* down */
+            case 'C': return 1002; /* right */
+            case 'D': return 1003; /* left */
         }
         return '\033';
     }
-    return (unsigned char)c;
+    return c;
 }
 
 static volatile sig_atomic_t resized = 0;
@@ -560,6 +629,7 @@ int main(int argc, char **argv) {
     order = malloc(ntracks * sizeof(int));
     if (!order) { perror("malloc"); return 1; }
     build_order();
+    rebuild_view();   /* initial view = all tracks */
 
     have_pactl = (system("command -v pactl >/dev/null 2>&1") == 0);
 
@@ -604,23 +674,54 @@ int main(int argc, char **argv) {
 
         if (rv > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
             int k = read_key();
-            switch (k) {
-                case 1000: case 'k': if (sel > 0) sel--; break;
-                case 1001: case 'j': if (sel < ntracks - 1) sel++; break;
-                case '\r': case '\n': play_track(sel, 0); break;
-                case ' ': case 'p':
-                    if (cur < 0) play_track(sel, 0); else toggle_pause(); break;
-                case 'n': next_track(); break;
-                case 'b': prev_track(); break;
-                case 1002: seek(5); break;    /* right */
-                case 1003: seek(-5); break;   /* left */
-                case '-': case '_': set_volume(-5); break;
-                case '+': case '=': set_volume(5); break;
-                case 'r': repeat = !repeat; break;
-                case 's': shuffle = !shuffle; build_order(); break;
-                case 'g': sel = 0; break;
-                case 'G': sel = ntracks - 1; break;
-                case 'q': case 3: running = 0; break;
+            if (searching) {
+                /* ---- search input mode ---- */
+                switch (k) {
+                    case 1000: if (sel > 0) sel--; break;            /* up */
+                    case 1001: if (sel < nview - 1) sel++; break;    /* down */
+                    case '\r': case '\n':
+                        searching = 0;                               /* keep filter */
+                        if (nview > 0) play_track(view[sel], 0);
+                        break;
+                    case '\033':                                     /* esc: clear */
+                        searching = 0; qlen = 0; query[0] = '\0'; rebuild_view();
+                        break;
+                    case 127: case 8:                                /* backspace */
+                        if (qlen > 0) { query[--qlen] = '\0'; rebuild_view(); }
+                        break;
+                    default:
+                        if (k >= 32 && k < 127 && qlen < (int)sizeof(query) - 1) {
+                            query[qlen++] = (char)k; query[qlen] = '\0';
+                            rebuild_view();
+                        }
+                        break;
+                }
+            } else {
+                /* ---- normal mode ---- */
+                switch (k) {
+                    case 1000: case 'k': if (sel > 0) sel--; break;
+                    case 1001: case 'j': if (sel < nview - 1) sel++; break;
+                    case '\r': case '\n': if (nview > 0) play_track(view[sel], 0); break;
+                    case ' ': case 'p':
+                        if (cur < 0) { if (nview > 0) play_track(view[sel], 0); }
+                        else toggle_pause();
+                        break;
+                    case 'n': next_track(); break;
+                    case 'b': prev_track(); break;
+                    case 1002: seek(5); break;    /* right */
+                    case 1003: seek(-5); break;   /* left */
+                    case '-': case '_': set_volume(-5); break;
+                    case '+': case '=': set_volume(5); break;
+                    case 'r': repeat = !repeat; break;
+                    case 's': shuffle = !shuffle; build_order(); break;
+                    case '/': searching = 1; break;
+                    case '\033':                  /* esc clears an active filter */
+                        if (query[0]) { qlen = 0; query[0] = '\0'; rebuild_view(); }
+                        break;
+                    case 'g': sel = 0; break;
+                    case 'G': sel = nview ? nview - 1 : 0; break;
+                    case 'q': case 3: running = 0; break;
+                }
             }
             draw();
             last_draw = now_sec();

@@ -65,10 +65,19 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 | `n` / `b`      | next / previous         |
 | `←` / `→`      | seek −5s / +5s          |
 | `-` / `+`      | volume down / up        |
+| `/`            | search / filter tracks  |
 | `s`            | toggle shuffle          |
 | `r`            | toggle repeat (playlist)|
 | `g` / `G`      | jump to top / bottom    |
 | `q`            | quit                    |
+
+### Search
+
+Press `/` and type to filter the list live (case-insensitive, matches anywhere
+in the track name). While searching: `↑`/`↓` move through results, `Enter`
+plays the highlighted match and keeps the filter, `Esc` clears it. With a
+filter active, `Esc` in normal mode clears it too. Playback (next/prev) still
+walks the full library, not just the filtered results.
 
 ## How it works
 
