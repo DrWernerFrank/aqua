@@ -41,6 +41,10 @@ lengths. Minimal aqua/black/gray interface, no animations.
   libraries open instantly; files ffprobe can't read are cached with an
   unknown duration so they aren't re-probed every launch either
 - Tiny: one C file per platform, no build dependencies beyond libc/Win32
+- **Small memory footprint** — a 5,000-track library with a warm cache sits
+  around 3 MB RSS on Linux and ~5 MB working set on Windows (about 180 bytes
+  per track): repeated names (artist, album, folder) are stored once and
+  shared, and the cache is parsed in place and released right after startup
 
 ## Requirements
 
@@ -162,13 +166,25 @@ tracks. Clear the filter and the queue returns to the full library.
 - The list is grouped by album (or folder when untagged) and sorted by track
   number within each group; on the very first run the grouping settles as
   tags load, then stays instant.
-- Rendering is a diff against a shadow copy of the screen: each `draw()` emits
-  only the lines that actually changed, each positioned absolutely, bracketed
+- Rendering is a diff against a shadow of the screen: each `draw()` emits
+  only the lines whose content changed, each positioned absolutely, bracketed
   in synchronized updates (`\033[?2026h/l`) so supporting terminals never show
-  a partial frame. An unchanged screen writes zero bytes — while a track
-  plays, only the elapsed-time and bar lines update, about twice a second
-  total. Resizes repaint in place; the screen is blanked (`\033[2J`) exactly
-  once, at startup, never mid-session.
+  a partial frame. The shadow is kept as one 64-bit hash per line (a few KB),
+  and output accumulates in a small chunk buffer — so even a full repaint
+  never needs a whole-frame buffer. An unchanged screen writes zero bytes —
+  while a track plays, only the elapsed-time and bar lines update, about
+  twice a second total. Resizes repaint in place; the screen is blanked
+  (`\033[2J`) exactly once, at startup, never mid-session.
+- Memory is budgeted for large libraries. Track strings live in a bump
+  allocator (one allocation per 64 KiB, no per-string heap headers), and
+  folder/artist/album names are interned: a 10,000-track library with 500
+  albums stores 500 album names, not 10,000 copies. The display name is
+  derived from the path on demand, and the canonical cache key is computed
+  in a stack buffer only when needed, so neither is stored per track. On
+  startup the cache file is read into one buffer, parsed in place, and
+  released as soon as its entries have been merged into the track list —
+  a warm 5,000-track cache leaves no heap residue (the pages go straight
+  back to the OS: `malloc`+`munmap` on Linux, `VirtualAlloc` on Windows).
 - Volume is owned by whichever live backend answers at startup: ffplay's
   PulseAudio sink-input located by PID (`pactl`), the default sink
   (`wpctl`/`amixer`), or on Windows the Core Audio session of the ffplay

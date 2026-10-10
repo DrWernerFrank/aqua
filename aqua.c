@@ -29,6 +29,9 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <ctype.h>
+#ifdef __GLIBC__
+#include <malloc.h>   /* malloc_trim: hand freed cache pages back to the OS */
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -43,26 +46,40 @@
 #define RESET  "\033[0m"
 #define INVAQ  "\033[7;38;5;44m"   /* reverse aqua = selected row */
 
-/* ---- track model ---- */
+/* ---- track model ----
+ * Fields are chosen for a small footprint in big libraries: `name` and
+ * `abspath` are derived on demand (basename of path / canonical path in a
+ * stack buffer), and folder/artist/album/group strings are interned, so
+ * each distinct name is stored once no matter how many tracks share it. */
 typedef struct {
-    char *path;     /* full path passed to ffplay */
-    char *name;     /* filename without extension (fallback display) */
-    char *abspath;  /* canonical path, used as cache key */
-    char *folder;   /* parent folder name (album fallback) */
+    char *path;     /* full path passed to ffplay (relative to scan dir) */
+    char *folder;   /* parent folder name (album fallback), interned */
     long  mtime;    /* file modification time, for cache validation */
     double dur;     /* seconds, -1 if unknown */
     /* metadata from tags (NULL when absent) */
     char *title;
-    char *artist;
-    char *album;
+    char *artist;   /* interned */
+    char *album;    /* interned */
     char *group;    /* album if tagged, else folder; used for grouping/sort */
     int   trackno;  /* track number, 0 if unknown */
     int   probed;   /* 1 once ffprobe answered (even "no duration"), or cache hit */
 } Track;
 
+/* filename without extension, derived from path (no stored copy) */
+static const char *track_name(const Track *t, char *buf, size_t n) {
+    const char *p = strrchr(t->path, '/');
+    p = p ? p + 1 : t->path;
+    const char *dot = strrchr(p, '.');
+    size_t L = dot ? (size_t)(dot - p) : strlen(p);
+    if (L >= n) L = n - 1;
+    memcpy(buf, p, L);
+    buf[L] = '\0';
+    return buf;
+}
+
 /* display title: prefer the tag title, fall back to the filename */
-static const char *disp_title(const Track *t) {
-    return (t->title && *t->title) ? t->title : t->name;
+static const char *disp_title(const Track *t, char *buf, size_t n) {
+    return (t->title && *t->title) ? t->title : track_name(t, buf, n);
 }
 
 static Track *tracks = NULL;
@@ -165,34 +182,130 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
-static void add_track(const char *path, const char *fname) {
+/* ---- string arena ----
+ * Per-track strings (path, title) live in big bump-allocated blocks: one
+ * allocation per 64 KiB instead of one per string, so a large library costs
+ * its text and nothing else — no per-string heap headers, no fragmentation.
+ * Nothing in the arena is freed individually; the blocks are released
+ * together at exit. */
+static char *arena_ptr = NULL;
+static size_t arena_left = 0;
+static char **arena_blocks = NULL;
+static int nblocks = 0, capblocks = 0;
+
+static char *strpool(const char *s) {
+    size_t n = strlen(s) + 1;
+    if (n > arena_left) {
+        size_t bs = (n > (64 << 10)) ? n : (64 << 10);
+        char *b = malloc(bs);
+        if (!b) { perror("malloc"); exit(1); }
+        if (nblocks == capblocks) {
+            capblocks = capblocks ? capblocks * 2 : 16;
+            arena_blocks = realloc(arena_blocks, capblocks * sizeof(char *));
+            if (!arena_blocks) { perror("realloc"); exit(1); }
+        }
+        arena_blocks[nblocks++] = b;
+        arena_ptr = b; arena_left = bs;
+    }
+    char *p = arena_ptr;
+    memcpy(p, s, n);
+    arena_ptr += n; arena_left -= n;
+    return p;
+}
+
+static void free_arena(void) {
+    for (int i = 0; i < nblocks; i++) free(arena_blocks[i]);
+    free(arena_blocks);
+    arena_blocks = NULL; nblocks = capblocks = 0;
+    arena_ptr = NULL; arena_left = 0;
+}
+
+/* ---- interning for names that repeat across tracks ----
+ * Folder, artist and album names are shared by every track in the group;
+ * interning stores each distinct name once (in the arena) and hands out
+ * that pointer, so a 10,000-track library with 500 albums pays for 500
+ * album names, not 10,000 copies of them. */
+typedef struct Inode { char *s; struct Inode *next; } Inode;
+static Inode **itab = NULL;
+static size_t itab_mask = 0;
+static size_t icount = 0;
+
+static unsigned long long str_hash(const char *s) {
+    unsigned long long h = 1469598103934665603ULL;      /* FNV-1a 64 */
+    while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+static char *intern(const char *s) {
+    if (!s || !*s) return (char *)"";
+    if (!itab) {
+        itab_mask = 2047;
+        itab = calloc(itab_mask + 1, sizeof(Inode *));
+        if (!itab) { perror("calloc"); exit(1); }
+    }
+    size_t i = (size_t)(str_hash(s) & itab_mask);
+    for (Inode *n = itab[i]; n; n = n->next)
+        if (strcmp(n->s, s) == 0) return n->s;
+    /* grow when chains get long */
+    if (icount > (itab_mask + 1) * 2) {
+        size_t nm = itab_mask * 2 + 1;
+        Inode **nt = calloc(nm + 1, sizeof(Inode *));
+        if (!nt) { perror("calloc"); exit(1); }
+        for (size_t b = 0; b <= itab_mask; b++)
+            for (Inode *n = itab[b]; n; ) {
+                Inode *nx = n->next;
+                size_t j = (size_t)(str_hash(n->s) & nm);
+                n->next = nt[j]; nt[j] = n;
+                n = nx;
+            }
+        free(itab);
+        itab = nt; itab_mask = nm;
+        i = (size_t)(str_hash(s) & itab_mask);
+    }
+    Inode *n = malloc(sizeof *n);
+    if (!n) { perror("malloc"); exit(1); }
+    n->s = strpool(s);
+    n->next = itab[i];
+    itab[i] = n;
+    icount++;
+    return n->s;
+}
+
+static void free_intern(void) {
+    if (!itab) return;
+    for (size_t b = 0; b <= itab_mask; b++)
+        for (Inode *n = itab[b]; n; ) {
+            Inode *nx = n->next;
+            free(n);
+            n = nx;
+        }
+    free(itab);
+    itab = NULL; itab_mask = 0; icount = 0;
+}
+
+static void add_track(const char *path) {
     if (ntracks == capacity) {
-        capacity = capacity ? capacity * 2 : 64;
+        /* start big: a single large (page-mapped) block instead of a ladder
+         * of small reallocs whose freed copies would stay resident */
+        capacity = capacity ? capacity * 2 : 4096;
         tracks = realloc(tracks, capacity * sizeof(Track));
         if (!tracks) { perror("realloc"); exit(1); }
     }
     Track *t = &tracks[ntracks++];
-    t->path = xstrdup(path);
-    /* display name: basename without extension */
-    char buf[1024];
-    snprintf(buf, sizeof buf, "%s", fname);
-    char *dot = strrchr(buf, '.');
-    if (dot) *dot = '\0';
-    t->name = xstrdup(buf);
+    t->path = strpool(path);
 
-    /* parent folder name (album fallback) */
+    /* parent folder name (album fallback), shared by every track in it */
     char pbuf[2048];
     snprintf(pbuf, sizeof pbuf, "%s", path);
     char *slash = strrchr(pbuf, '/');           /* strip filename */
     if (slash) {
         *slash = '\0';
         char *par = strrchr(pbuf, '/');          /* parent dir basename */
-        t->folder = xstrdup(par ? par + 1 : pbuf);
+        t->folder = intern(par ? par + 1 : pbuf);
     } else {
-        t->folder = xstrdup("");
+        t->folder = intern("");
     }
 
-    t->abspath = NULL;
     t->mtime = 0;
     t->dur = -1;
     t->title = t->artist = t->album = NULL;
@@ -214,14 +327,16 @@ static void scan_dir(const char *dir, int depth) {
             closedir(sub);
             if (depth > 0) scan_dir(full, depth - 1);
         } else if (is_audio(e->d_name)) {
-            add_track(full, e->d_name);
+            add_track(full);
         }
     }
     closedir(d);
 }
 
 static int cmp_track(const void *a, const void *b) {
-    return strcasecmp(((const Track *)a)->name, ((const Track *)b)->name);
+    char na[1024], nb[1024];
+    return strcasecmp(track_name((const Track *)a, na, sizeof na),
+                      track_name((const Track *)b, nb, sizeof nb));
 }
 
 /* group = album when tagged, otherwise the parent folder name */
@@ -229,12 +344,22 @@ static void apply_group(Track *t) {
     t->group = (t->album && *t->album) ? t->album : t->folder;
 }
 
-/* dup a string with tabs/newlines flattened to spaces, or NULL if empty */
+/* arena-copy a string with tabs/newlines flattened to spaces, or NULL if empty */
 static char *dup_clean(const char *s) {
     if (!s || !*s) return NULL;
-    char *p = xstrdup(s);
+    char *p = strpool(s);
     for (char *q = p; *q; q++) if (*q == '\t' || *q == '\n' || *q == '\r') *q = ' ';
     return p;
+}
+
+/* same, but the result is interned (artist/album repeat across tracks) */
+static char *intern_clean(const char *s) {
+    if (!s || !*s) return NULL;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", s);
+    for (char *q = buf; *q; q++)
+        if (*q == '\t' || *q == '\n' || *q == '\r') *q = ' ';
+    return intern(buf);
 }
 
 /* ---- metadata via ffprobe (duration + title/artist/album/track) ----
@@ -271,9 +396,9 @@ static int probe_meta(Track *t) {
             size_t L = strlen(val);
             while (L && (val[L-1] == '\n' || val[L-1] == '\r')) val[--L] = '\0';
             if (strcmp(key, "duration") == 0)             t->dur = atof(val) > 0 ? atof(val) : -1;
-            else if (strcasecmp(key, "TAG:title") == 0)  { free(t->title);  t->title  = dup_clean(val); }
-            else if (strcasecmp(key, "TAG:artist") == 0) { free(t->artist); t->artist = dup_clean(val); }
-            else if (strcasecmp(key, "TAG:album") == 0)  { free(t->album);  t->album  = dup_clean(val); }
+            else if (strcasecmp(key, "TAG:title") == 0)   t->title  = dup_clean(val);
+            else if (strcasecmp(key, "TAG:artist") == 0) t->artist = intern_clean(val);
+            else if (strcasecmp(key, "TAG:album") == 0)  t->album  = intern_clean(val);
             else if (strcasecmp(key, "TAG:track") == 0)  t->trackno = atoi(val);  /* "3/12" -> 3 */
         }
         fclose(p);
@@ -297,6 +422,7 @@ static int probe_meta(Track *t) {
 typedef struct {
     char *path; long mtime; double dur; int trackno;
     char *title, *artist, *album;
+    int dead;      /* consumed by a track this session; dropped after merge */
 } CacheEnt;
 static CacheEnt *cache = NULL;
 static int ncache = 0, capcache = 0;
@@ -340,50 +466,75 @@ static void put_escaped(FILE *f, const char *s) {
     }
 }
 
-/* inverse of put_escaped; unknown escapes are kept byte-for-byte */
-static char *dup_unescaped(const char *s) {
-    char *out = xmalloc(strlen(s) + 1);
-    char *w = out;
-    for (const char *p = s; *p; ) {
-        if (p[0] == '\\' && p[1] == 'n')  { *w++ = '\n'; p += 2; }
-        else if (p[0] == '\\' && p[1] == 't')  { *w++ = '\t'; p += 2; }
-        else if (p[0] == '\\' && p[1] == 'r')  { *w++ = '\r'; p += 2; }
-        else if (p[0] == '\\' && p[1] == '\\') { *w++ = '\\'; p += 2; }
-        else *w++ = *p++;
+/* inverse of put_escaped, in place (the result is never longer); unknown
+ * escapes are kept byte-for-byte */
+static char *unescape_in(char *s) {
+    char *w = s, *r = s;
+    while (*r) {
+        if (r[0] == '\\' && r[1] == 'n')  { *w++ = '\n'; r += 2; }
+        else if (r[0] == '\\' && r[1] == 't')  { *w++ = '\t'; r += 2; }
+        else if (r[0] == '\\' && r[1] == 'r')  { *w++ = '\r'; r += 2; }
+        else if (r[0] == '\\' && r[1] == '\\') { *w++ = '\\'; r += 2; }
+        else *w++ = *r++;
     }
     *w = '\0';
-    return out;
+    return s;
 }
 
+/* the loaded cache: one whole-file buffer. Entries point into it, so a
+ * warm 5,000-track cache costs one large (OS-returnable) allocation
+ * instead of four small ones per track — and freeing it after the merge
+ * hands the pages straight back instead of leaving heap holes. */
+static char *cache_buf = NULL;
+
 static void load_cache(void) {
-    FILE *f = fopen(cache_file, "r");
+    FILE *f = fopen(cache_file, "rb");
     if (!f) return;
-    char line[PATH_MAX * 2 + 512];   /* escaped fields can grow past the path */
-    while (fgets(line, sizeof line, f)) {
-        size_t L = strlen(line);
-        if (L && line[L-1] == '\n') line[--L] = '\0';
-        char *p = line;
-        long  mt   = strtol(next_field(&p), NULL, 10);
-        double dur = strtod(next_field(&p), NULL);
-        int   trk  = atoi(next_field(&p));
-        char *title  = next_field(&p);
-        char *artist = next_field(&p);
-        char *album  = next_field(&p);
-        char *path   = p;                 /* remainder is the path */
-        if (!*path) continue;
-        if (ncache == capcache) {
-            capcache = capcache ? capcache * 2 : 256;
-            cache = realloc(cache, capcache * sizeof(CacheEnt));
-            if (!cache) { perror("realloc"); exit(1); }
-        }
-        CacheEnt *e = &cache[ncache++];
-        e->path = dup_unescaped(path);
-        e->mtime = mt; e->dur = dur; e->trackno = trk;
-        e->title  = *title  ? dup_unescaped(title)  : NULL;
-        e->artist = *artist ? dup_unescaped(artist) : NULL;
-        e->album  = *album  ? dup_unescaped(album)  : NULL;
-    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    long sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return; }
+    if (sz == 0) { fclose(f); return; }
+    cache_buf = malloc((size_t)sz + 2);
+    if (!cache_buf) { fclose(f); return; }
+    size_t got = fread(cache_buf, 1, (size_t)sz, f);
     fclose(f);
+    if (got == 0) { free(cache_buf); cache_buf = NULL; return; }
+    cache_buf[got] = '\n';               /* every line ends with \n */
+    cache_buf[got + 1] = '\0';
+
+    /* exact array size: no growth churn on load */
+    int lines = 1;
+    for (size_t i = 0; i < got; i++)
+        if (cache_buf[i] == '\n') lines++;
+    capcache = lines;
+    cache = xmalloc(capcache * sizeof(CacheEnt));
+
+    ncache = 0;
+    char *p = cache_buf;
+    while (*p) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        else break;
+        if (nl > p && nl[-1] == '\r') nl[-1] = '\0';   /* CRLF caches (cross-platform files) */
+        char *q = p;
+        p = nl + 1;
+        long  mt   = strtol(next_field(&q), NULL, 10);
+        double dur = strtod(next_field(&q), NULL);
+        int   trk  = atoi(next_field(&q));
+        char *title  = next_field(&q);
+        char *artist = next_field(&q);
+        char *album  = next_field(&q);
+        char *path   = q;                 /* remainder is the path */
+        if (!*path) continue;
+        CacheEnt *e = &cache[ncache++];
+        e->path   = unescape_in(path);    /* non-empty: checked above */
+        e->mtime  = mt; e->dur = dur; e->trackno = trk;
+        e->title  = *title  ? unescape_in(title)  : NULL;
+        e->artist = *artist ? unescape_in(artist) : NULL;
+        e->album  = *album  ? unescape_in(album)  : NULL;
+        e->dead = 0;
+    }
+    if (ncache == 0) { free(cache); cache = NULL; capcache = 0; }
     if (ncache) qsort(cache, ncache, sizeof(CacheEnt), cmp_cache);
 }
 
@@ -395,10 +546,10 @@ static CacheEnt *cache_lookup(const char *path, long mtime) {
 }
 
 /* insert or update an entry from a track (linear; runs once at save time) */
-static void cache_upsert(const Track *t) {
+static void cache_upsert(const Track *t, const char *abspath) {
     CacheEnt *e = NULL;
     for (int i = 0; i < ncache; i++)
-        if (strcmp(cache[i].path, t->abspath) == 0) { e = &cache[i]; break; }
+        if (strcmp(cache[i].path, abspath) == 0) { e = &cache[i]; break; }
     if (!e) {
         if (ncache == capcache) {
             capcache = capcache ? capcache * 2 : 256;
@@ -406,7 +557,7 @@ static void cache_upsert(const Track *t) {
             if (!cache) { perror("realloc"); exit(1); }
         }
         e = &cache[ncache++];
-        e->path = xstrdup(t->abspath);
+        e->path = xstrdup(abspath);
         e->title = e->artist = e->album = NULL;
     } else {
         free(e->title); free(e->artist); free(e->album);   /* cache owns its strings */
@@ -415,13 +566,17 @@ static void cache_upsert(const Track *t) {
     e->title  = t->title  ? xstrdup(t->title)  : NULL;
     e->artist = t->artist ? xstrdup(t->artist) : NULL;
     e->album  = t->album  ? xstrdup(t->album)  : NULL;
+    e->dead = 0;
 }
 
 static void save_cache(void) {
     if (!cache_file[0]) return;
-    for (int i = 0; i < ntracks; i++)
-        if (tracks[i].probed && tracks[i].abspath)
-            cache_upsert(&tracks[i]);
+    for (int i = 0; i < ntracks; i++) {
+        if (!tracks[i].probed) continue;
+        char rp[PATH_MAX];
+        const char *ap = realpath(tracks[i].path, rp) ? rp : tracks[i].path;
+        cache_upsert(&tracks[i], ap);
+    }
     FILE *f = fopen(cache_file, "w");
     if (!f) return;
     for (int i = 0; i < ncache; i++) {
@@ -583,7 +738,8 @@ static int ci_contains(const char *hay, const char *needle) {
 /* a track matches the query if any of its fields contain it */
 static int track_matches(const Track *t, const char *q) {
     if (!*q) return 1;
-    return ci_contains(t->name, q)
+    char nb[1024];
+    return ci_contains(track_name(t, nb, sizeof nb), q)
         || (t->title  && ci_contains(t->title, q))
         || (t->artist && ci_contains(t->artist, q))
         || (t->album  && ci_contains(t->album, q));
@@ -596,7 +752,8 @@ static int cmp_by_trackno(const Track *ta, const Track *tb) {
         if (tb->trackno == 0) return -1;
         return ta->trackno - tb->trackno;
     }
-    return strcasecmp(disp_title(ta), disp_title(tb));
+    char ba[1024], bb[1024];
+    return strcasecmp(disp_title(ta, ba, sizeof ba), disp_title(tb, bb, sizeof bb));
 }
 
 /* order the view depending on context:
@@ -612,9 +769,11 @@ static int cmp_view(const void *a, const void *b) {
         if (c) return c;
         return cmp_by_trackno(ta, tb);
     }
-    int c = strcasecmp(disp_title(ta), disp_title(tb));   /* Tracks tab: by title */
-    if (c) return c;
-    return strcasecmp(ta->name, tb->name);
+    char ba[1024], bb[1024];
+    int c = strcasecmp(disp_title(ta, ba, sizeof ba), disp_title(tb, bb, sizeof bb));
+    if (c) return c;                                   /* Tracks tab: by title */
+    char na[1024], nb[1024];
+    return strcasecmp(track_name(ta, na, sizeof na), track_name(tb, nb, sizeof nb));
 }
 
 /* rebuild the track view: all tracks (Tracks tab) or one album's tracks
@@ -847,24 +1006,39 @@ static int page_size = 10;      /* visible rows; draw() keeps it current */
 #define MAX_LIST_ROWS 400       /* cap so one frame always fits in out[] */
 
 /* ---- flicker-free rendering ----
- * A shadow copy of the last painted frame sits under the screen: draw()
- * emits only the lines that actually changed, each positioned absolutely,
- * inside synchronized-update brackets, so the terminal never shows a
- * partial frame. An unchanged screen emits nothing at all — the display
- * sits still instead of repainting (and flashing) at 10 Hz. Resizes
- * repaint in place; \033[2J (blank, then redraw = a hard flash) happens
- * exactly once, at startup. */
+ * The last painted frame is remembered as one 64-bit hash per screen line
+ * (a few KB, not a text copy of the screen): draw() emits only the lines
+ * whose hash changed, each positioned absolutely, inside synchronized-
+ * update brackets, so the terminal never shows a partial frame. An
+ * unchanged screen emits nothing at all — the display sits still instead
+ * of repainting (and flashing) at 10 Hz. Resizes repaint in place;
+ * \033[2J (blank, then redraw = a hard flash) happens exactly once, at
+ * startup. Output accumulates in a small chunk buffer that is flushed as
+ * it fills, so even a full repaint never needs a whole-frame buffer. */
 #define MAX_LINE 1024                       /* one rendered screen line */
 #define MAX_FRAME_LINES (MAX_LIST_ROWS + 8)
-static char shadow[MAX_FRAME_LINES][MAX_LINE];
+static unsigned long long shadow_hash[MAX_FRAME_LINES];
 static int  shadow_count = 0;               /* rows valid in the shadow */
 
-/* overwrite one screen line unless it already shows exactly this */
-static void flush_line(char *out, size_t cap, int *o, int row, const char *line) {
+/* the current delta: bounded chunk buffer + whether anything was written */
+typedef struct { char buf[8192]; int n; int wrote; } Delta;
+
+static void delta_flush(Delta *d) {
+    if (d->n) { write_all(d->buf, d->n); d->n = 0; }
+}
+
+/* overwrite one screen line unless its hash says it's already shown */
+static void flush_line(Delta *d, int row, const char *line) {
     if (row >= MAX_FRAME_LINES) return;
-    if (row < shadow_count && strcmp(shadow[row], line) == 0) return;
-    *o = emit(out, cap, *o, "\033[%d;1H%s\033[K", row + 1, line);
-    strcpy(shadow[row], line);
+    unsigned long long h = str_hash(line);
+    if (row < shadow_count && shadow_hash[row] == h) return;
+    if (!d->wrote) {                        /* first change opens the bracket */
+        d->n = emit(d->buf, sizeof d->buf, d->n, "\033[?2026h");
+        d->wrote = 1;
+    }
+    d->n = emit(d->buf, sizeof d->buf, d->n, "\033[%d;1H%s\033[K", row + 1, line);
+    if (d->n > (int)sizeof d->buf - MAX_LINE - 32) delta_flush(d);
+    shadow_hash[row] = h;
 }
 
 static void draw(void) {
@@ -893,9 +1067,9 @@ static void draw(void) {
     int full = (rows != last_rows || cols != last_cols);
     if (full) { shadow_count = 0; last_rows = rows; last_cols = cols; }
 
-    static char out[1 << 18];               /* 256 KiB frame buffer */
+    Delta del = {{0}, 0, 0};                 /* bounded output chunk */
     char line[MAX_LINE];
-    int o = 0, lo = 0, row = 0;
+    int lo = 0, row = 0;
 
     /* ---- tab bar ---- */
     const char *t_tracks  = (tab == TAB_TRACKS)  ? INVAQ " Tracks "  RESET : DGRAY " Tracks "  RESET;
@@ -903,7 +1077,7 @@ static void draw(void) {
     const char *t_artists = (tab == TAB_ARTISTS) ? INVAQ " Artists " RESET : DGRAY " Artists " RESET;
     lo = emit(line, sizeof line, 0,
         AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s", t_tracks, t_albums, t_artists);
-    flush_line(out, sizeof out, &o, row++, line);
+    flush_line(&del, row++, line);
 
     /* ---- breadcrumb / search line ---- */
     if (searching)
@@ -926,7 +1100,7 @@ static void draw(void) {
     else
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "%d tracks" RESET, ntracks);
-    flush_line(out, sizeof out, &o, row++, line);
+    flush_line(&del, row++, line);
 
     /* ---- list body ---- */
     for (int i = 0; i < list_h; i++) {
@@ -942,7 +1116,7 @@ static void draw(void) {
                 lo = 0;
                 line[0] = '\0';
             }
-            flush_line(out, sizeof out, &o, row++, line);
+            flush_line(&del, row++, line);
             continue;
         }
 
@@ -961,7 +1135,7 @@ static void draw(void) {
                 lo = emit(line, sizeof line, 0,
                     " " WHITE "%-*.*s" RESET " " DGRAY "%6s" RESET,
                     nw, nw, *an ? an : "(unknown)", cbuf);
-            flush_line(out, sizeof out, &o, row++, line);
+            flush_line(&del, row++, line);
             continue;
         }
 
@@ -978,7 +1152,8 @@ static void draw(void) {
         const char *marker = (idx == cur) ? (paused ? "\xE2\x9D\x9A " : "\xE2\x96\xB6 ") : "  ";
         int name_w = cols - 16;
         if (name_w < 8) name_w = 8;
-        const char *title = disp_title(t);
+        char nbuf[1024];
+        const char *title = disp_title(t, nbuf, sizeof nbuf);
 
         if (r == sel)
             lo = emit(line, sizeof line, 0,
@@ -990,14 +1165,14 @@ static void draw(void) {
                 " %s%s" DGRAY "%s " RESET "%s%-*.*s" RESET " " DGRAY "%5s" RESET,
                 col, marker, num, col, name_w, name_w, title, dbuf);
         }
-        flush_line(out, sizeof out, &o, row++, line);
+        flush_line(&del, row++, line);
     }
 
     /* footer */
     lo = emit(line, sizeof line, 0, DGRAY);
     for (int i = 0; i < cols && i < 200 && lo < (int)sizeof line - 2; i++) line[lo++] = '-';
     emit(line, sizeof line, lo, RESET);
-    flush_line(out, sizeof out, &o, row++, line);
+    flush_line(&del, row++, line);
 
     if (cur >= 0) {
         double el = elapsed(), dur = tracks[cur].dur;
@@ -1007,16 +1182,17 @@ static void draw(void) {
 
         const char *state = paused ? GRAY "PAUSED" : AQUA "PLAYING";
         /* "Title — Artist" when an artist tag exists */
-        char now[1024];
+        char now[1024], tbuf[1024];
+        const char *dtitle = disp_title(&tracks[cur], tbuf, sizeof tbuf);
         if (tracks[cur].artist && *tracks[cur].artist)
             snprintf(now, sizeof now, "%s \xE2\x80\x94 %s",
-                     disp_title(&tracks[cur]), tracks[cur].artist);
+                     dtitle, tracks[cur].artist);
         else
-            snprintf(now, sizeof now, "%s", disp_title(&tracks[cur]));
+            snprintf(now, sizeof now, "%s", dtitle);
         lo = emit(line, sizeof line, 0,
             "  %s" RESET " " WHITE "%-*.*s" RESET,
             state, cols - 14, cols - 14, now);
-        flush_line(out, sizeof out, &o, row++, line);
+        flush_line(&del, row++, line);
 
         /* progress bar */
         int bar_w = cols - 20;
@@ -1029,12 +1205,12 @@ static void draw(void) {
         lo = emit(line, sizeof line, lo, DGRAY);
         for (int i = fill; i < bar_w; i++)  lo = emit(line, sizeof line, lo, "\xE2\x94\x80");
         emit(line, sizeof line, lo, " " GRAY "%5s" RESET, d);
-        flush_line(out, sizeof out, &o, row++, line);
+        flush_line(&del, row++, line);
     } else {
         emit(line, sizeof line, 0, "  " GRAY "Nothing playing" RESET);
-        flush_line(out, sizeof out, &o, row++, line);
+        flush_line(&del, row++, line);
         line[0] = '\0';
-        flush_line(out, sizeof out, &o, row++, line);
+        flush_line(&del, row++, line);
     }
 
     /* help line */
@@ -1056,18 +1232,19 @@ static void draw(void) {
             shuffle ? AQUA " on" GRAY : "",
             repeat == REP_ALL ? AQUA " all" GRAY : repeat == REP_ONE ? AQUA " one" GRAY : "",
             in_album ? DGRAY "esc" GRAY " back  " : "");
-    flush_line(out, sizeof out, &o, row++, line);
+    flush_line(&del, row++, line);
 
     /* wipe leftovers below a shortened frame, then publish the delta */
-    if (full && row < rows)
-        o = emit(out, sizeof out, o, "\033[%d;1H\033[J", row + 1);
+    if (full && row < rows) {
+        if (!del.wrote) { del.n = emit(del.buf, sizeof del.buf, del.n, "\033[?2026h"); del.wrote = 1; }
+        del.n = emit(del.buf, sizeof del.buf, del.n, "\033[%d;1H\033[J", row + 1);
+    }
     shadow_count = row;
 
-    if (o == 0) return;                    /* nothing changed: emit nothing */
-
-    write_all("\033[?2026h", 8);            /* synchronized update: no tearing */
-    write_all(out, o);
-    write_all("\033[?2026l", 8);
+    if (del.wrote) {                        /* nothing changed: emit nothing */
+        delta_flush(&del);
+        write_all("\033[?2026l", 8);
+    }
 }
 
 /* ---- input ---- */
@@ -1150,27 +1327,65 @@ int main(int argc, char **argv) {
     }
     qsort(tracks, ntracks, sizeof(Track), cmp_track);
 
-    /* resolve canonical paths + mtimes, then prefill durations from cache */
-    for (int i = 0; i < ntracks; i++) {
-        char rp[PATH_MAX];
-        tracks[i].abspath = xstrdup(realpath(tracks[i].path, rp) ? rp : tracks[i].path);
-        struct stat st;
-        if (stat(tracks[i].path, &st) == 0) tracks[i].mtime = (long)st.st_mtime;
-    }
     init_cache_path();
     load_cache();
+
+    /* canonical paths + mtimes, then prefill durations from cache.
+     * The canonical path lives in a stack buffer: it's needed only here (as
+     * the cache key) and again at save time, so a 5,000-track library
+     * doesn't carry 5,000 ~80-byte path strings all session. */
     for (int i = 0; i < ntracks; i++) {
-        CacheEnt *e = cache_lookup(tracks[i].abspath, tracks[i].mtime);
+        char rp[PATH_MAX];
+        const char *ap = realpath(tracks[i].path, rp) ? rp : tracks[i].path;
+        struct stat st;
+        if (stat(tracks[i].path, &st) == 0) tracks[i].mtime = (long)st.st_mtime;
+        CacheEnt *e = cache_lookup(ap, tracks[i].mtime);
         if (e) {
             tracks[i].dur = e->dur;          /* may be -1: probed, no duration */
             tracks[i].trackno = e->trackno;
-            tracks[i].title  = e->title  ? xstrdup(e->title)  : NULL;
-            tracks[i].artist = e->artist ? xstrdup(e->artist) : NULL;
-            tracks[i].album  = e->album  ? xstrdup(e->album)  : NULL;
+            tracks[i].title  = e->title  ? strpool(e->title)  : NULL;
+            tracks[i].artist = e->artist ? intern(e->artist) : NULL;
+            tracks[i].album  = e->album  ? intern(e->album)  : NULL;
             tracks[i].probed = 1;            /* cached: don't probe again */
             apply_group(&tracks[i]);
+            /* consumed: the tags now live in tracks[] (shared/interned); the
+             * entry is marked dead and goes when the buffer is released.
+             * save_cache() re-creates it at exit, so nothing is lost. */
+            e->dead = 1;
         }
     }
+    /* drop consumed entries: their data lives in tracks[] only. Survivors
+     * are files probed under a different folder or with a newer mtime —
+     * their strings point into cache_buf and must be copied out before
+     * the buffer is freed. */
+    {
+        int w = 0;
+        for (int i = 0; i < ncache; i++) {
+            if (cache[i].dead) continue;
+            CacheEnt *e = &cache[w];
+            if (w != i) *e = cache[i];
+            e->path = xstrdup(e->path);
+            if (e->title)  e->title  = xstrdup(e->title);
+            if (e->artist) e->artist = xstrdup(e->artist);
+            if (e->album)  e->album  = xstrdup(e->album);
+            w++;
+        }
+        ncache = w;
+    }
+    free(cache_buf); cache_buf = NULL;
+    /* the cache array itself: shrink to what survives (usually nothing when
+     * the whole library came from cache) — save_cache() grows it again */
+    if (ncache == 0) { free(cache); cache = NULL; capcache = 0; }
+    else if (ncache < capcache) {
+        CacheEnt *nc = realloc(cache, ncache * sizeof(CacheEnt));
+        if (nc) { cache = nc; capcache = ncache; }
+    }
+#ifdef __GLIBC__
+    /* the freed cache strings leave holes glibc keeps resident; give the
+     * pages back so the steady-state footprint is the library, not the
+     * load transient */
+    malloc_trim(0);
+#endif
 
     srand((unsigned)time(NULL));
     queue = xmalloc(ntracks * sizeof(int));
@@ -1374,6 +1589,8 @@ int main(int argc, char **argv) {
 
     stop_child();
     save_cache();          /* persist anything probed this session */
+    free_arena();          /* track strings: one bulk release, no per-string frees */
+    free_intern();
     term_restore();
     return 0;
 }
