@@ -846,6 +846,27 @@ static int scroll_top = 0;
 static int page_size = 10;      /* visible rows; draw() keeps it current */
 #define MAX_LIST_ROWS 400       /* cap so one frame always fits in out[] */
 
+/* ---- flicker-free rendering ----
+ * A shadow copy of the last painted frame sits under the screen: draw()
+ * emits only the lines that actually changed, each positioned absolutely,
+ * inside synchronized-update brackets, so the terminal never shows a
+ * partial frame. An unchanged screen emits nothing at all — the display
+ * sits still instead of repainting (and flashing) at 10 Hz. Resizes
+ * repaint in place; \033[2J (blank, then redraw = a hard flash) happens
+ * exactly once, at startup. */
+#define MAX_LINE 1024                       /* one rendered screen line */
+#define MAX_FRAME_LINES (MAX_LIST_ROWS + 8)
+static char shadow[MAX_FRAME_LINES][MAX_LINE];
+static int  shadow_count = 0;               /* rows valid in the shadow */
+
+/* overwrite one screen line unless it already shows exactly this */
+static void flush_line(char *out, size_t cap, int *o, int row, const char *line) {
+    if (row >= MAX_FRAME_LINES) return;
+    if (row < shadow_count && strcmp(shadow[row], line) == 0) return;
+    *o = emit(out, cap, *o, "\033[%d;1H%s\033[K", row + 1, line);
+    strcpy(shadow[row], line);
+}
+
 static void draw(void) {
     int rows, cols;
     get_size(&rows, &cols);
@@ -867,52 +888,61 @@ static void draw(void) {
     if (asel >= scroll_top + list_h) scroll_top = asel - list_h + 1;
     if (scroll_top < 0) scroll_top = 0;
 
-    static char out[1 << 17];               /* 128 KiB frame buffer */
-    int o = 0;
-    o = emit(out, sizeof out, o, "\033[H");   /* home */
+    /* a resize changes geometry: repaint everything in place, no blanking */
+    static int last_rows = -1, last_cols = -1;
+    int full = (rows != last_rows || cols != last_cols);
+    if (full) { shadow_count = 0; last_rows = rows; last_cols = cols; }
+
+    static char out[1 << 18];               /* 256 KiB frame buffer */
+    char line[MAX_LINE];
+    int o = 0, lo = 0, row = 0;
 
     /* ---- tab bar ---- */
     const char *t_tracks  = (tab == TAB_TRACKS)  ? INVAQ " Tracks "  RESET : DGRAY " Tracks "  RESET;
     const char *t_albums  = (tab == TAB_ALBUMS)  ? INVAQ " Albums "  RESET : DGRAY " Albums "  RESET;
     const char *t_artists = (tab == TAB_ARTISTS) ? INVAQ " Artists " RESET : DGRAY " Artists " RESET;
-    o = emit(out, sizeof out, o,
-        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s" "\033[K\r\n", t_tracks, t_albums, t_artists);
+    lo = emit(line, sizeof line, 0,
+        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s", t_tracks, t_albums, t_artists);
+    flush_line(out, sizeof out, &o, row++, line);
 
     /* ---- breadcrumb / search line ---- */
     if (searching)
-        o = emit(out, sizeof out, o,
+        lo = emit(line, sizeof line, 0,
             "  " AQUA "/" WHITE "%s" AQUA "\xE2\x96\x88" RESET
-            DGRAY "   %d matches" RESET "\033[K\r\n", query, acount);
+            DGRAY "   %d matches" RESET, query, acount);
     else if (in_album)
-        o = emit(out, sizeof out, o,
+        lo = emit(line, sizeof line, 0,
             "  " DGRAY "%s \xE2\x96\xB8 " AQUA "%s" DGRAY
-            "   %d tracks%s%s  (esc: back)" RESET "\033[K\r\n",
+            "   %d tracks%s%s  (esc: back)" RESET,
             browse_label(), cur_album ? cur_album : "", nview,
             query[0] ? "  filter: " : "", query[0] ? query : "");
     else if (query[0])
-        o = emit(out, sizeof out, o,
-            "  " DGRAY "filter: " AQUA "%s" DGRAY "  (esc to clear)" RESET "\033[K\r\n", query);
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "filter: " AQUA "%s" DGRAY "  (esc to clear)" RESET, query);
     else if (album_list)
-        o = emit(out, sizeof out, o,
-            "  " DGRAY "%d %s" RESET "\033[K\r\n",
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "%d %s" RESET,
             nalbums, tab == TAB_ARTISTS ? "artists" : "albums");
     else
-        o = emit(out, sizeof out, o,
-            "  " DGRAY "%d tracks" RESET "\033[K\r\n", ntracks);
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "%d tracks" RESET, ntracks);
+    flush_line(out, sizeof out, &o, row++, line);
 
     /* ---- list body ---- */
     for (int i = 0; i < list_h; i++) {
         int r = scroll_top + i;
-        o = emit(out, sizeof out, o, "\033[K");
         if (r >= acount) {
             if (acount == 0 && i == 0)
-                o = emit(out, sizeof out, o,
-                    "  " DGRAY "%s" RESET "\r\n",
+                lo = emit(line, sizeof line, 0,
+                    "  " DGRAY "%s" RESET,
                     query[0] ? "No matches." :
                     (album_list ? (tab == TAB_ARTISTS ? "No artists." : "No albums.")
                                 : "No tracks."));
-            else
-                o = emit(out, sizeof out, o, "\r\n");
+            else {
+                lo = 0;
+                line[0] = '\0';
+            }
+            flush_line(out, sizeof out, &o, row++, line);
             continue;
         }
 
@@ -924,13 +954,14 @@ static void draw(void) {
             int nw = cols - 12;
             if (nw < 8) nw = 8;
             if (r == alsel)
-                o = emit(out, sizeof out, o,
-                    INVAQ " %-*.*s %6s " RESET "\r\n",
+                lo = emit(line, sizeof line, 0,
+                    INVAQ " %-*.*s %6s " RESET,
                     nw, nw, *an ? an : "(unknown)", cbuf);
             else
-                o = emit(out, sizeof out, o,
-                    " " WHITE "%-*.*s" RESET " " DGRAY "%6s" RESET "\r\n",
+                lo = emit(line, sizeof line, 0,
+                    " " WHITE "%-*.*s" RESET " " DGRAY "%6s" RESET,
                     nw, nw, *an ? an : "(unknown)", cbuf);
+            flush_line(out, sizeof out, &o, row++, line);
             continue;
         }
 
@@ -949,22 +980,24 @@ static void draw(void) {
         if (name_w < 8) name_w = 8;
         const char *title = disp_title(t);
 
-        if (r == sel) {
-            o = emit(out, sizeof out, o,
-                INVAQ " %s%s %-*.*s %5s " RESET "\r\n",
+        if (r == sel)
+            lo = emit(line, sizeof line, 0,
+                INVAQ " %s%s %-*.*s %5s " RESET,
                 marker, num, name_w, name_w, title, dbuf);
-        } else {
+        else {
             const char *col = (idx == cur) ? AQUA : WHITE;
-            o = emit(out, sizeof out, o,
-                " %s%s" DGRAY "%s " RESET "%s%-*.*s" RESET " " DGRAY "%5s" RESET "\r\n",
+            lo = emit(line, sizeof line, 0,
+                " %s%s" DGRAY "%s " RESET "%s%-*.*s" RESET " " DGRAY "%5s" RESET,
                 col, marker, num, col, name_w, name_w, title, dbuf);
         }
+        flush_line(out, sizeof out, &o, row++, line);
     }
 
     /* footer */
-    o = emit(out, sizeof out, o, DGRAY);
-    for (int i = 0; i < cols && i < 200 && o < (int)sizeof out - 1; i++) out[o++] = '-';
-    o = emit(out, sizeof out, o, RESET "\033[K\r\n");
+    lo = emit(line, sizeof line, 0, DGRAY);
+    for (int i = 0; i < cols && i < 200 && lo < (int)sizeof line - 2; i++) line[lo++] = '-';
+    emit(line, sizeof line, lo, RESET);
+    flush_line(out, sizeof out, &o, row++, line);
 
     if (cur >= 0) {
         double el = elapsed(), dur = tracks[cur].dur;
@@ -980,9 +1013,10 @@ static void draw(void) {
                      disp_title(&tracks[cur]), tracks[cur].artist);
         else
             snprintf(now, sizeof now, "%s", disp_title(&tracks[cur]));
-        o = emit(out, sizeof out, o,
-            "  %s" RESET " " WHITE "%-*.*s" RESET "\033[K\r\n",
+        lo = emit(line, sizeof line, 0,
+            "  %s" RESET " " WHITE "%-*.*s" RESET,
             state, cols - 14, cols - 14, now);
+        flush_line(out, sizeof out, &o, row++, line);
 
         /* progress bar */
         int bar_w = cols - 20;
@@ -990,39 +1024,50 @@ static void draw(void) {
         int fill = (dur > 0) ? (int)(bar_w * (el / dur)) : 0;
         if (fill > bar_w) fill = bar_w;
         if (fill < 0) fill = 0;
-        o = emit(out, sizeof out, o, "  " GRAY "%5s " AQUA, e);
-        for (int i = 0; i < fill; i++)      o = emit(out, sizeof out, o, "\xE2\x96\x88");
-        o = emit(out, sizeof out, o, DGRAY);
-        for (int i = fill; i < bar_w; i++)  o = emit(out, sizeof out, o, "\xE2\x94\x80");
-        o = emit(out, sizeof out, o, " " GRAY "%5s" RESET "\033[K\r\n", d);
+        lo = emit(line, sizeof line, 0, "  " GRAY "%5s " AQUA, e);
+        for (int i = 0; i < fill; i++)      lo = emit(line, sizeof line, lo, "\xE2\x96\x88");
+        lo = emit(line, sizeof line, lo, DGRAY);
+        for (int i = fill; i < bar_w; i++)  lo = emit(line, sizeof line, lo, "\xE2\x94\x80");
+        emit(line, sizeof line, lo, " " GRAY "%5s" RESET, d);
+        flush_line(out, sizeof out, &o, row++, line);
     } else {
-        o = emit(out, sizeof out, o, "  " GRAY "Nothing playing" RESET "\033[K\r\n");
-        o = emit(out, sizeof out, o, "\033[K\r\n");
+        emit(line, sizeof line, 0, "  " GRAY "Nothing playing" RESET);
+        flush_line(out, sizeof out, &o, row++, line);
+        line[0] = '\0';
+        flush_line(out, sizeof out, &o, row++, line);
     }
 
     /* help line */
     if (searching)
-        o = emit(out, sizeof out, o,
+        lo = emit(line, sizeof line, 0,
             "  " DGRAY "type to filter   " DGRAY "\xE2\x86\xB5" GRAY " keep  "
-            DGRAY "esc" GRAY " clear  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move" RESET "\033[K");
+            DGRAY "esc" GRAY " clear  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move" RESET);
     else if (on_album_list())
-        o = emit(out, sizeof out, o,
+        lo = emit(line, sizeof line, 0,
             "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " open  "
-            DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "/" GRAY " search  " DGRAY "q" GRAY " quit" RESET "\033[K");
+            DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "/" GRAY " search  " DGRAY "q" GRAY " quit" RESET);
     else
-        o = emit(out, sizeof out, o,
+        lo = emit(line, sizeof line, 0,
             "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5/space" GRAY " play  "
             DGRAY "n/b" GRAY " next/prev  " DGRAY "\xE2\x86\x90\xE2\x86\x92" GRAY " seek  "
             DGRAY "-/+" GRAY " vol %d%%  " DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "/" GRAY " search  "
-            DGRAY "s" GRAY " shuf%s  " DGRAY "r" GRAY " rep%s  " "%s" DGRAY "q" GRAY " quit" RESET "\033[K",
+            DGRAY "s" GRAY " shuf%s  " DGRAY "r" GRAY " rep%s  " "%s" DGRAY "q" GRAY " quit" RESET,
             volume,
             shuffle ? AQUA " on" GRAY : "",
             repeat == REP_ALL ? AQUA " all" GRAY : repeat == REP_ONE ? AQUA " one" GRAY : "",
             in_album ? DGRAY "esc" GRAY " back  " : "");
+    flush_line(out, sizeof out, &o, row++, line);
 
-    o = emit(out, sizeof out, o, "\033[J");   /* clear below */
+    /* wipe leftovers below a shortened frame, then publish the delta */
+    if (full && row < rows)
+        o = emit(out, sizeof out, o, "\033[%d;1H\033[J", row + 1);
+    shadow_count = row;
 
+    if (o == 0) return;                    /* nothing changed: emit nothing */
+
+    write_all("\033[?2026h", 8);            /* synchronized update: no tearing */
     write_all(out, o);
+    write_all("\033[?2026l", 8);
 }
 
 /* ---- input ---- */
@@ -1172,7 +1217,7 @@ int main(int argc, char **argv) {
 
         volume_tick();   /* debounced volume restarts, live-volume retries */
 
-        if (resized) { resized = 0; printf("\033[2J"); fflush(stdout); }
+        if (resized) resized = 0;   /* draw() sees the new geometry and repaints in place */
 
         int probing = probe_idx < ntracks;
 
