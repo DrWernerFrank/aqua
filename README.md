@@ -1,8 +1,8 @@
 # ♬ aqua
 
-A tiny, fast terminal music player. One C file, no libraries, no GUI — it
-shells out to **ffplay** for audio and uses **ffprobe** for track lengths.
-Minimal aqua/black/gray interface, no animations.
+A tiny, fast terminal music player. One C file per platform, no libraries, no
+GUI — it shells out to **ffplay** for audio and uses **ffprobe** for track
+lengths. Minimal aqua/black/gray interface, no animations.
 
 ```
   ♬ AQUA   1024 tracks
@@ -12,7 +12,7 @@ Minimal aqua/black/gray interface, no animations.
   ...
   ─────────────────────────────────────────────────
   PLAYING  Bonobo - Kerala
-   1:12 ████████████░░░░░░░░░░░░░░░░░░░░  3:54
+   1:12 ████████████░░░░░░░░░░░░░░░░  3:54
   ↑↓ move  ↵/space play/pause  n/b next/prev  ←→ seek  -/+ vol  s shuffle  r repeat  q quit
 ```
 
@@ -24,20 +24,30 @@ Minimal aqua/black/gray interface, no animations.
   Albums browser (open an album to see its tracks in track-number order), and an
   Artists browser (open an artist to see their tracks by album then track).
   Untagged files fall back to their containing folder name as the album
-- Play / pause (true pause via `SIGSTOP`/`SIGCONT`), next / previous, seek
-- **Gapless volume** — adjusts the live PulseAudio stream, no restart
-- **Shuffle** and **repeat**
+- Play / pause (a true pause: `SIGSTOP`/`SIGCONT` on Linux, thread-suspend on
+  Windows), next / previous, seek
+- **Volume without dropouts** — applied live, in place: through `pactl`,
+  `wpctl` or `amixer` on Linux (the first that answers), and through the
+  Windows Core Audio per-app session on Windows. `+`/`-` never restart
+  playback when a live backend exists; without one, the track is restarted
+  *once* after you stop pressing the key (not once per key repeat), and a
+  change made while paused is applied on resume
+- **Shuffle** and **repeat** (off / all / one)
 - **Search** across title, artist, album and filename
-- **Metadata cache** in `~/.cache/aqua/` — only new or modified files are
-  re-probed, so large libraries open instantly
-- Tiny: a single C file, no build dependencies beyond libc
+- **Metadata cache** — only new or modified files are re-probed, so large
+  libraries open instantly; files ffprobe can't read are cached with an
+  unknown duration so they aren't re-probed every launch either
+- Tiny: one C file per platform, no build dependencies beyond libc/Win32
 
 ## Requirements
 
 - A C compiler (`cc`/`gcc`) and `make`
-- [`ffmpeg`](https://ffmpeg.org/) — provides `ffplay` (playback) and `ffprobe` (durations)
-- PulseAudio's `pactl` *(optional)* — enables gapless volume; without it,
-  volume changes fall back to a quick restart
+- [`ffmpeg`](https://ffmpeg.org/) — provides `ffplay` (playback) and
+  `ffprobe` (durations + tags)
+- Linux only, optional: `pactl` (`pulseaudio-utils`), `wpctl` or `amixer`
+  for live volume. Without any of them, a volume key restarts the track at
+  its current position once the keys settle — a brief gap, but never a
+  stutter chain
 
 On Debian/Ubuntu/Linux Lite:
 
@@ -45,7 +55,7 @@ On Debian/Ubuntu/Linux Lite:
 sudo apt install build-essential ffmpeg
 ```
 
-## Build & install
+## Build & install (Linux)
 
 ```sh
 make                 # builds ./aqua
@@ -53,6 +63,35 @@ make install         # installs to ~/.local/bin/aqua  (override PREFIX=...)
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
+
+## Windows
+
+A native Windows port lives in **`aqua_win.c`** (no WSL, no Cygwin). It swaps
+the POSIX platform layer for the Win32 Console API + VT sequences,
+`CreateProcess` + Toolhelp thread-suspend (in place of `fork`/`SIGSTOP`),
+`QueryPerformanceCounter`, and `_kbhit`/`_getch`. The metadata cache lives in
+`%LOCALAPPDATA%\aqua\library.tsv`. Volume is changed live through the Windows
+Core Audio session of the running `ffplay` process, so `+`/`-` never restart
+playback. That level is the one you see for `ffplay.exe` in the Windows Volume
+Mixer; Windows remembers it between tracks and runs, and aqua picks it up at
+startup instead of resetting it to 100%.
+
+```powershell
+# Requirements: a MinGW-w64 gcc, plus ffmpeg on PATH (winget install Gyan.FFmpeg)
+gcc -O2 -Wall -o aqua.exe aqua_win.c
+aqua.exe "%USERPROFILE%\Music"
+```
+
+Or run **`install-windows.ps1`** (in this repo) to build, install to
+`%LOCALAPPDATA%\Programs\aqua`, and add an **aqua** entry to the Start Menu:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-windows.ps1
+```
+
+Both ports share one design and one metadata format; the Linux and Windows
+caches are interchangeable, so a library scanned on one is instant on the
+other (over a shared drive).
 
 ## Usage
 
@@ -75,8 +114,9 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 | `Tab`          | cycle Tracks/Albums/Artists |
 | `s`            | toggle shuffle          |
 | `r`            | repeat: off / all / one |
-| `g` / `G`      | jump to top / bottom    |
-| `q`            | quit                    |
+| `g` / `G`, `Home` / `End` | jump to top / bottom |
+| `PgUp` / `PgDn`| move a page            |
+| `q` / `Ctrl-C` | quit                    |
 
 ### Tabs
 
@@ -100,16 +140,32 @@ tracks. Clear the filter and the queue returns to the full library.
 
 ## How it works
 
-- Playback is an `ffplay -nodisp -autoexit` child process. Pause sends it
-  `SIGSTOP`/`SIGCONT`; next/seek replace it.
-- Metadata (duration + title/artist/album/track) is read with `ffprobe` lazily
-  inside the main loop (the UI is responsive immediately) and cached to
-  `~/.cache/aqua/library.tsv`, keyed by absolute path + modification time.
-  Delete that file to force a full rescan. The list is grouped by album (or
-  folder when untagged) and sorted by track number within each group; on the
-  very first run the grouping settles as tags load, then stays instant.
-- Volume changes locate ffplay's PulseAudio sink-input by PID and set its
-  volume with `pactl`, so the audio never cuts out.
+- Playback is an `ffplay -nodisp -autoexit` child process. Pause suspends it
+  (`SIGSTOP`/`SIGCONT` on Linux, thread suspend/resume on Windows);
+  next/seek replace it. `Ctrl-C` and terminal close quit through the normal
+  exit path: ffplay is stopped, the metadata cache is written, and the
+  terminal is restored — no raw-terminal leftovers, no orphaned audio.
+- Metadata (duration + title/artist/album/track) is read with `ffprobe`
+  lazily inside the main loop (the UI is responsive immediately) and cached
+  (`~/.cache/aqua/library.tsv` on Linux, `%LOCALAPPDATA%\aqua\library.tsv`
+  on Windows), keyed by absolute path + modification time. ffprobe is
+  executed directly with the path as a single argument — no shell sits in
+  between, so filenames like `$(touch pwned).mp3` are just filenames — and
+  text fields are escaped in the cache, so newlines or tabs in names can't
+  corrupt it. Files ffprobe can't read are cached with duration `-1` and
+  skipped on later runs too; if ffprobe itself is missing, nothing bogus is
+  cached and the library is probed once ffmpeg is installed. Delete the
+  cache file to force a rescan.
+- The list is grouped by album (or folder when untagged) and sorted by track
+  number within each group; on the very first run the grouping settles as
+  tags load, then stays instant.
+- Volume is owned by whichever live backend answers at startup: ffplay's
+  PulseAudio sink-input located by PID (`pactl`), the default sink
+  (`wpctl`/`amixer`), or on Windows the Core Audio session of the ffplay
+  process. On Linux a live backend keeps the ffplay stream itself at 100%
+  software volume, so the level is never applied twice. If the stream hasn't
+  registered yet (right after a track starts), the change is retried in the
+  main loop rather than restarting.
 
 ## License
 

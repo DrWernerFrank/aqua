@@ -12,10 +12,12 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <dirent.h>
 #include <signal.h>
 #include <termios.h>
@@ -55,6 +57,7 @@ typedef struct {
     char *album;
     char *group;    /* album if tagged, else folder; used for grouping/sort */
     int   trackno;  /* track number, 0 if unknown */
+    int   probed;   /* 1 once ffprobe answered (even "no duration"), or cache hit */
 } Track;
 
 /* display title: prefer the tag title, fall back to the filename */
@@ -79,7 +82,7 @@ static int searching = 0;    /* 1 while typing a query */
 enum { TAB_TRACKS, TAB_ALBUMS, TAB_ARTISTS, TAB_COUNT };
 static int tab = TAB_TRACKS;
 static int in_album = 0;             /* 1 = drilled into an album's tracks */
-static char cur_album[256] = "";     /* the album currently opened */
+static char *cur_album = NULL;      /* the album currently opened (owned string) */
 static int view_sort = 0;            /* 0 = by title, 1 = by track number */
 
 /* album list (distinct groups), and its filtered view for search */
@@ -108,11 +111,21 @@ static const char *browse_label(void) {
 static pid_t child = -1;     /* ffplay pid, -1 = none */
 static int paused = 0;
 static int intentional = 0;  /* we killed ffplay, don't auto-advance */
-static int volume = 100;
+static int volume = 100;     /* the single source of truth for output level */
 enum { REP_OFF, REP_ALL, REP_ONE };
 static int repeat = REP_OFF; /* off / repeat-all (loop queue) / repeat-one (track) */
-static int have_pactl = 0;   /* set if PulseAudio's pactl is available */
 static int shuffle = 0;      /* random play order */
+
+/* Volume backends, tried in this order. `volume` is the authority; the chosen
+ * backend applies it live. ffplay itself carries the volume only when no
+ * backend exists (VOL_NONE), where a debounced restart is the only way to
+ * change a running stream. */
+enum { VOL_PACTL, VOL_WPCTL, VOL_AMIXER, VOL_NONE };
+static int vol_backend = VOL_NONE;
+static int vol_dirty = 0;        /* pactl: the running stream lacks `volume` */
+static int vol_fails = 0;        /* consecutive backend failures -> degrade */
+static int spawned_vol = 100;    /* -volume the running ffplay started with */
+static double restart_at = 0;   /* debounced volume restart, 0 = none */
 
 /* play queue: the sequence next/prev walk through. It mirrors the current
  * view[] (so search results become the queue), optionally shuffled. */
@@ -139,6 +152,12 @@ static int is_audio(const char *name) {
 }
 
 /* ---- collection ---- */
+static void *xmalloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) { perror("malloc"); exit(1); }
+    return p;
+}
+
 static char *xstrdup(const char *s) {
     char *p = malloc(strlen(s) + 1);
     if (!p) { perror("malloc"); exit(1); }
@@ -179,6 +198,7 @@ static void add_track(const char *path, const char *fname) {
     t->title = t->artist = t->album = NULL;
     t->group = t->folder;        /* refined to album once tags are read */
     t->trackno = 0;
+    t->probed = 0;
 }
 
 static void scan_dir(const char *dir, int depth) {
@@ -217,36 +237,63 @@ static char *dup_clean(const char *s) {
     return p;
 }
 
-/* ---- metadata via ffprobe (duration + title/artist/album/track) ---- */
-static void probe_meta(Track *t) {
-    char cmd[2600];
-    snprintf(cmd, sizeof cmd,
-        "ffprobe -v error -show_entries "
-        "format=duration:format_tags=title,artist,album,track,TITLE,ARTIST,ALBUM,TRACK "
-        "-of default=noprint_wrappers=1 \"%s\" 2>/dev/null", t->path);
-    FILE *p = popen(cmd, "r");
-    if (!p) { t->dur = -1; return; }
-    char line[1024];
-    while (fgets(line, sizeof line, p)) {
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char *key = line, *val = eq + 1;
-        size_t L = strlen(val);
-        while (L && (val[L-1] == '\n' || val[L-1] == '\r')) val[--L] = '\0';
-        if (strcmp(key, "duration") == 0)            t->dur = atof(val) > 0 ? atof(val) : -1;
-        else if (strcasecmp(key, "TAG:title") == 0)  { free(t->title);  t->title  = dup_clean(val); }
-        else if (strcasecmp(key, "TAG:artist") == 0) { free(t->artist); t->artist = dup_clean(val); }
-        else if (strcasecmp(key, "TAG:album") == 0)  { free(t->album);  t->album  = dup_clean(val); }
-        else if (strcasecmp(key, "TAG:track") == 0)  t->trackno = atoi(val);  /* "3/12" -> 3 */
+/* ---- metadata via ffprobe (duration + title/artist/album/track) ----
+ * ffprobe is exec'd directly with the path as a single argv element — there
+ * is no shell between us and it, so filenames can't inject commands. Returns
+ * 1 when the probe is definitive (ffprobe ran, even if it found no duration),
+ * 0 when ffprobe itself couldn't run — the file is then retried next session. */
+static int probe_meta(Track *t) {
+    int fds[2];
+    if (pipe(fds) != 0) return 0;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return 0; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+        int n = open("/dev/null", O_WRONLY);
+        if (n >= 0) dup2(n, STDERR_FILENO);
+        execlp("ffprobe", "ffprobe", "-v", "error", "-show_entries",
+               "format=duration:format_tags=title,artist,album,track,TITLE,ARTIST,ALBUM,TRACK",
+               "-of", "default=noprint_wrappers=1", t->path, (char *)NULL);
+        _exit(127);                    /* ffprobe missing */
     }
-    pclose(p);
+    close(fds[1]);
+    int definitive = 0;
+    FILE *p = fdopen(fds[0], "r");
+    if (p) {
+        char line[1024];
+        while (fgets(line, sizeof line, p)) {
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            char *key = line, *val = eq + 1;
+            size_t L = strlen(val);
+            while (L && (val[L-1] == '\n' || val[L-1] == '\r')) val[--L] = '\0';
+            if (strcmp(key, "duration") == 0)             t->dur = atof(val) > 0 ? atof(val) : -1;
+            else if (strcasecmp(key, "TAG:title") == 0)  { free(t->title);  t->title  = dup_clean(val); }
+            else if (strcasecmp(key, "TAG:artist") == 0) { free(t->artist); t->artist = dup_clean(val); }
+            else if (strcasecmp(key, "TAG:album") == 0)  { free(t->album);  t->album  = dup_clean(val); }
+            else if (strcasecmp(key, "TAG:track") == 0)  t->trackno = atoi(val);  /* "3/12" -> 3 */
+        }
+        fclose(p);
+        int st = 0;
+        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) != 127)
+            definitive = 1;
+    } else {
+        close(fds[0]);
+        waitpid(pid, NULL, 0);
+    }
     apply_group(t);
+    return definitive;
 }
 
 /* ---- metadata cache (~/.cache/aqua/library.tsv) ----
  * Each line: <mtime>\t<dur>\t<trackno>\t<title>\t<artist>\t<album>\t<abspath>
- * Only new or modified files are probed; everything else is read from here. */
+ * Only new or modified files are probed; everything else is read from here.
+ * Files ffprobe couldn't get a duration from are stored with dur -1 so they
+ * aren't re-probed on every launch either. Text fields are escaped with
+ * put_escaped(), so newlines/tabs/backslashes can never corrupt a line. */
 typedef struct {
     char *path; long mtime; double dur; int trackno;
     char *title, *artist, *album;
@@ -280,10 +327,38 @@ static char *next_field(char **pp) {
     return s;
 }
 
+/* write s with \, \n, \t, \r escaped so one cache line is always one file */
+static void put_escaped(FILE *f, const char *s) {
+    for (; *s; s++) {
+        switch (*s) {
+        case '\n': fputc('\\', f); fputc('n', f); break;
+        case '\t': fputc('\\', f); fputc('t', f); break;
+        case '\r': fputc('\\', f); fputc('r', f); break;
+        case '\\': fputc('\\', f); fputc('\\', f); break;
+        default:   fputc(*s, f);
+        }
+    }
+}
+
+/* inverse of put_escaped; unknown escapes are kept byte-for-byte */
+static char *dup_unescaped(const char *s) {
+    char *out = xmalloc(strlen(s) + 1);
+    char *w = out;
+    for (const char *p = s; *p; ) {
+        if (p[0] == '\\' && p[1] == 'n')  { *w++ = '\n'; p += 2; }
+        else if (p[0] == '\\' && p[1] == 't')  { *w++ = '\t'; p += 2; }
+        else if (p[0] == '\\' && p[1] == 'r')  { *w++ = '\r'; p += 2; }
+        else if (p[0] == '\\' && p[1] == '\\') { *w++ = '\\'; p += 2; }
+        else *w++ = *p++;
+    }
+    *w = '\0';
+    return out;
+}
+
 static void load_cache(void) {
     FILE *f = fopen(cache_file, "r");
     if (!f) return;
-    char line[PATH_MAX + 256];
+    char line[PATH_MAX * 2 + 512];   /* escaped fields can grow past the path */
     while (fgets(line, sizeof line, f)) {
         size_t L = strlen(line);
         if (L && line[L-1] == '\n') line[--L] = '\0';
@@ -302,14 +377,14 @@ static void load_cache(void) {
             if (!cache) { perror("realloc"); exit(1); }
         }
         CacheEnt *e = &cache[ncache++];
-        e->path = xstrdup(path);
+        e->path = dup_unescaped(path);
         e->mtime = mt; e->dur = dur; e->trackno = trk;
-        e->title  = *title  ? xstrdup(title)  : NULL;
-        e->artist = *artist ? xstrdup(artist) : NULL;
-        e->album  = *album  ? xstrdup(album)  : NULL;
+        e->title  = *title  ? dup_unescaped(title)  : NULL;
+        e->artist = *artist ? dup_unescaped(artist) : NULL;
+        e->album  = *album  ? dup_unescaped(album)  : NULL;
     }
     fclose(f);
-    qsort(cache, ncache, sizeof(CacheEnt), cmp_cache);
+    if (ncache) qsort(cache, ncache, sizeof(CacheEnt), cmp_cache);
 }
 
 static CacheEnt *cache_lookup(const char *path, long mtime) {
@@ -332,26 +407,30 @@ static void cache_upsert(const Track *t) {
         }
         e = &cache[ncache++];
         e->path = xstrdup(t->abspath);
+        e->title = e->artist = e->album = NULL;
+    } else {
+        free(e->title); free(e->artist); free(e->album);   /* cache owns its strings */
     }
     e->mtime = t->mtime; e->dur = t->dur; e->trackno = t->trackno;
-    e->title  = t->title;   /* shares the track's strings; only used until save */
-    e->artist = t->artist;
-    e->album  = t->album;
+    e->title  = t->title  ? xstrdup(t->title)  : NULL;
+    e->artist = t->artist ? xstrdup(t->artist) : NULL;
+    e->album  = t->album  ? xstrdup(t->album)  : NULL;
 }
 
 static void save_cache(void) {
     if (!cache_file[0]) return;
     for (int i = 0; i < ntracks; i++)
-        if (tracks[i].dur > 0 && tracks[i].abspath)
+        if (tracks[i].probed && tracks[i].abspath)
             cache_upsert(&tracks[i]);
     FILE *f = fopen(cache_file, "w");
     if (!f) return;
     for (int i = 0; i < ncache; i++) {
         CacheEnt *e = &cache[i];
-        fprintf(f, "%ld\t%.3f\t%d\t%s\t%s\t%s\t%s\n",
-                e->mtime, e->dur, e->trackno,
-                e->title ? e->title : "", e->artist ? e->artist : "",
-                e->album ? e->album : "", e->path);
+        fprintf(f, "%ld\t%.3f\t%d\t", e->mtime, e->dur, e->trackno);
+        put_escaped(f, e->title  ? e->title  : ""); fputc('\t', f);
+        put_escaped(f, e->artist ? e->artist : ""); fputc('\t', f);
+        put_escaped(f, e->album  ? e->album  : ""); fputc('\t', f);
+        put_escaped(f, e->path); fputc('\n', f);
     }
     fclose(f);
 }
@@ -360,7 +439,7 @@ static void save_cache(void) {
 static void term_raw(void) {
     tcgetattr(STDIN_FILENO, &orig_termios);
     struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_lflag &= ~(ECHO | ICANON);   /* ISIG stays on: ^C arrives as a signal */
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
@@ -414,10 +493,15 @@ static void play_track(int idx, double startpos) {
     clock_gettime(CLOCK_MONOTONIC, &t_start);
     paused = 0;
 
+    /* ffplay carries the volume itself only when no live backend can adjust
+     * a running stream; otherwise keep software volume neutral and let the
+     * backend own the level (so it is never applied twice). */
+    int vol = (vol_backend == VOL_NONE) ? volume : 100;
+    spawned_vol = vol;
     char ss[32] = "";
     if (startpos > 0) snprintf(ss, sizeof ss, "%.2f", startpos);
-    char vol[16];
-    snprintf(vol, sizeof vol, "%d", volume);
+    char vols[16];
+    snprintf(vols, sizeof vols, "%d", vol);
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -425,21 +509,29 @@ static void play_track(int idx, double startpos) {
         if (n >= 0) { dup2(n, STDOUT_FILENO); dup2(n, STDERR_FILENO); }
         if (startpos > 0)
             execlp("ffplay", "ffplay", "-nodisp", "-autoexit",
-                   "-loglevel", "quiet", "-volume", vol, "-ss", ss,
+                   "-loglevel", "quiet", "-volume", vols, "-ss", ss,
                    tracks[idx].path, (char *)NULL);
         else
             execlp("ffplay", "ffplay", "-nodisp", "-autoexit",
-                   "-loglevel", "quiet", "-volume", vol,
+                   "-loglevel", "quiet", "-volume", vols,
                    tracks[idx].path, (char *)NULL);
         _exit(127);
     }
     child = pid;
     intentional = 0;
+    restart_at = 0;                    /* the new stream already carries it */
+    vol_dirty = (vol_backend == VOL_PACTL && volume != 100);
 }
 
 static void toggle_pause(void) {
     if (child <= 0) return;
     if (paused) {
+        /* if the volume changed while paused and only a respawn can apply it,
+         * resume from the paused position with the new volume */
+        if (vol_backend == VOL_NONE && volume != spawned_vol) {
+            play_track(cur, base_elapsed);
+            return;
+        }
         clock_gettime(CLOCK_MONOTONIC, &t_start);
         kill(child, SIGCONT);
         paused = 0;
@@ -528,10 +620,11 @@ static int cmp_view(const void *a, const void *b) {
 /* rebuild the track view: all tracks (Tracks tab) or one album's tracks
  * (when an album is opened), filtered by the query. */
 static void rebuild_view(void) {
-    if (!view) view = malloc((ntracks ? ntracks : 1) * sizeof(int));
+    if (!view) view = xmalloc((ntracks ? ntracks : 1) * sizeof(int));
     nview = 0;
     for (int i = 0; i < ntracks; i++) {
-        if (in_album && strcasecmp(browse_key(&tracks[i]), cur_album) != 0) continue;
+        if (in_album && cur_album &&
+            strcasecmp(browse_key(&tracks[i]), cur_album) != 0) continue;
         if (!track_matches(&tracks[i], query)) continue;
         view[nview++] = i;
     }
@@ -551,10 +644,10 @@ static int cmp_group_idx(const void *a, const void *b) {
 static void build_albums(void) {
     static int *tmp = NULL;
     if (!albums) {
-        albums  = malloc((ntracks ? ntracks : 1) * sizeof(char *));
-        album_n = malloc((ntracks ? ntracks : 1) * sizeof(int));
-        alview  = malloc((ntracks ? ntracks : 1) * sizeof(int));
-        tmp     = malloc((ntracks ? ntracks : 1) * sizeof(int));
+        albums  = xmalloc((ntracks ? ntracks : 1) * sizeof(char *));
+        album_n = xmalloc((ntracks ? ntracks : 1) * sizeof(int));
+        alview  = xmalloc((ntracks ? ntracks : 1) * sizeof(int));
+        tmp     = xmalloc((ntracks ? ntracks : 1) * sizeof(int));
     }
     for (int i = 0; i < ntracks; i++) tmp[i] = i;
     qsort(tmp, ntracks, sizeof(int), cmp_group_idx);
@@ -586,7 +679,8 @@ static void clear_query(void) { qlen = 0; query[0] = '\0'; }
 
 /* switch to a tab, resetting drill-down and any active search */
 static void switch_tab(int t) {
-    tab = t; in_album = 0; cur_album[0] = '\0';
+    tab = t; in_album = 0;
+    free(cur_album); cur_album = NULL;
     searching = 0; clear_query();
     if (tab == TAB_TRACKS) rebuild_view();
     else { build_albums(); rebuild_albums_view(); alsel = 0; }
@@ -595,14 +689,16 @@ static void switch_tab(int t) {
 /* open an album from the album list (ai indexes albums[]) */
 static void open_album(int ai) {
     in_album = 1;
-    snprintf(cur_album, sizeof cur_album, "%s", albums[ai]);
+    free(cur_album);
+    cur_album = xstrdup(albums[ai]);   /* any length: no truncation */
     searching = 0; clear_query(); sel = 0;
     rebuild_view();
 }
 
 /* return from an opened album back to the album list */
 static void back_to_albums(void) {
-    in_album = 0; cur_album[0] = '\0';
+    in_album = 0;
+    free(cur_album); cur_album = NULL;
     searching = 0; clear_query();
     build_albums(); rebuild_albums_view();
 }
@@ -643,7 +739,7 @@ static void seek(double delta) {
 /* Change the volume of the live ffplay stream via PulseAudio (no restart, no
  * gap). Matches the sink-input by ffplay's PID. Returns 1 on success. */
 static int pulse_set_volume(pid_t pid, int pct) {
-    if (!have_pactl || pid <= 0) return 0;
+    if (vol_backend != VOL_PACTL || pid <= 0) return 0;
     char cmd[640];
     snprintf(cmd, sizeof cmd,
         "idx=$(pactl list sink-inputs 2>/dev/null | "
@@ -654,17 +750,92 @@ static int pulse_set_volume(pid_t pid, int pct) {
     return system(cmd) == 0;
 }
 
+/* System-level fallbacks (PipeWire's wpctl, then plain amixer). They move the
+ * default sink rather than aqua's own stream, but they never interrupt audio. */
+static int wire_set_volume(int pct) {
+    char cmd[160];
+    if (vol_backend == VOL_WPCTL)
+        snprintf(cmd, sizeof cmd,
+                 "wpctl set-volume @DEFAULT_AUDIO_SINK@ %d%% >/dev/null 2>&1", pct);
+    else
+        snprintf(cmd, sizeof cmd,
+                 "amixer -q sset Master %d%% >/dev/null 2>&1", pct);
+    return system(cmd) == 0;
+}
+
+/* pick the first backend that actually answers — presence alone isn't enough */
+static void detect_vol_backend(void) {
+    if (system("pactl info >/dev/null 2>&1") == 0)              vol_backend = VOL_PACTL;
+    else if (system("wpctl status >/dev/null 2>&1") == 0)       vol_backend = VOL_WPCTL;
+    else if (system("amixer sget Master >/dev/null 2>&1") == 0) vol_backend = VOL_AMIXER;
+    else                                                        vol_backend = VOL_NONE;
+}
+
 static void set_volume(int delta) {
     volume += delta;
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
-    if (cur < 0 || child <= 0) return;
-    /* Prefer a gapless live change; fall back to restarting only if needed. */
-    if (!pulse_set_volume(child, volume) && !paused)
-        play_track(cur, elapsed());
+    if (vol_backend == VOL_WPCTL || vol_backend == VOL_AMIXER) {
+        if (wire_set_volume(volume)) vol_fails = 0;
+        else if (++vol_fails >= 3) vol_backend = VOL_NONE;  /* broken: restart instead */
+        return;
+    }
+    if (vol_backend == VOL_PACTL) {
+        /* Live, gapless change — try right now so the key press is heard
+         * instantly. If ffplay hasn't registered its stream yet (right after
+         * a track starts), retry from the main loop instead of restarting
+         * the track — a restart is what makes the sound drop out. */
+        if (pulse_set_volume(child, volume)) { vol_dirty = 0; return; }
+        vol_dirty = 1;
+        return;                     /* idle: the next spawn re-applies it */
+    }
+    /* VOL_NONE: only a respawn can change the running stream. Debounce so held
+     * keys coalesce into one restart; a change made while paused is applied
+     * on resume (see toggle_pause). */
+    if (cur >= 0 && child > 0 && !paused)
+        restart_at = now_sec() + 0.25;
+}
+
+/* keep the running stream's volume in sync (called each main-loop pass) */
+static void volume_tick(void) {
+    if (restart_at > 0 && now_sec() >= restart_at) {
+        restart_at = 0;
+        if (cur >= 0 && child > 0 && !paused) play_track(cur, elapsed());
+    }
+    if (vol_dirty && child <= 0)
+        vol_dirty = 0;                 /* nothing to sync; next spawn carries it */
+    else if (vol_dirty && child > 0) {
+        if (pulse_set_volume(child, volume)) { vol_dirty = 0; vol_fails = 0; }
+        else if (++vol_fails >= 20) { vol_backend = VOL_NONE; vol_dirty = 0; vol_fails = 0; }
+    }
 }
 
 /* ---- rendering ---- */
+
+/* draw() builds each frame in a fixed buffer; emit() appends to it and clamps
+ * the offset, so a frame that would not fit is truncated, never overflowed. */
+static int emit(char *buf, size_t cap, int o, const char *fmt, ...) {
+    if (o < 0 || (size_t)o + 1 >= cap) return o;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + o, cap - (size_t)o, fmt, ap);
+    va_end(ap);
+    if (n < 0) return o;                    /* encoding error: drop this chunk */
+    o += n;
+    return o < (int)cap - 1 ? o : (int)cap - 1;
+}
+
+/* write a whole frame, retrying past partial writes and EINTR */
+static void write_all(const char *buf, int n) {
+    size_t left = (size_t)n;
+    while (left > 0) {
+        ssize_t w = write(STDOUT_FILENO, buf, left);
+        if (w > 0) { buf += w; left -= (size_t)w; }
+        else if (w < 0 && errno == EINTR) continue;
+        else break;                          /* terminal gone: drop the frame */
+    }
+}
+
 static void fmt_time(double s, char *buf, size_t n) {
     if (s < 0) { snprintf(buf, n, "--:--"); return; }
     int t = (int)(s + 0.5);
@@ -672,6 +843,8 @@ static void fmt_time(double s, char *buf, size_t n) {
 }
 
 static int scroll_top = 0;
+static int page_size = 10;      /* visible rows; draw() keeps it current */
+#define MAX_LIST_ROWS 400       /* cap so one frame always fits in out[] */
 
 static void draw(void) {
     int rows, cols;
@@ -682,6 +855,8 @@ static void draw(void) {
     int footer = 5;        /* divider, nowtitle, bar, help, pad */
     int list_h = rows - header - footer;
     if (list_h < 1) list_h = 1;
+    if (list_h > MAX_LIST_ROWS) list_h = MAX_LIST_ROWS;
+    page_size = list_h;
 
     int album_list = on_album_list();
     int asel   = album_list ? alsel   : sel;     /* active selection */
@@ -692,50 +867,52 @@ static void draw(void) {
     if (asel >= scroll_top + list_h) scroll_top = asel - list_h + 1;
     if (scroll_top < 0) scroll_top = 0;
 
-    char out[1 << 16];
+    static char out[1 << 17];               /* 128 KiB frame buffer */
     int o = 0;
-    o += snprintf(out + o, sizeof out - o, "\033[H");   /* home */
+    o = emit(out, sizeof out, o, "\033[H");   /* home */
 
     /* ---- tab bar ---- */
     const char *t_tracks  = (tab == TAB_TRACKS)  ? INVAQ " Tracks "  RESET : DGRAY " Tracks "  RESET;
     const char *t_albums  = (tab == TAB_ALBUMS)  ? INVAQ " Albums "  RESET : DGRAY " Albums "  RESET;
     const char *t_artists = (tab == TAB_ARTISTS) ? INVAQ " Artists " RESET : DGRAY " Artists " RESET;
-    o += snprintf(out + o, sizeof out - o,
+    o = emit(out, sizeof out, o,
         AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s" "\033[K\r\n", t_tracks, t_albums, t_artists);
 
     /* ---- breadcrumb / search line ---- */
     if (searching)
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  " AQUA "/" WHITE "%s" AQUA "\xE2\x96\x88" RESET
             DGRAY "   %d matches" RESET "\033[K\r\n", query, acount);
     else if (in_album)
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  " DGRAY "%s \xE2\x96\xB8 " AQUA "%s" DGRAY
-            "   %d tracks  (esc: back)" RESET "\033[K\r\n", browse_label(), cur_album, nview);
+            "   %d tracks%s%s  (esc: back)" RESET "\033[K\r\n",
+            browse_label(), cur_album ? cur_album : "", nview,
+            query[0] ? "  filter: " : "", query[0] ? query : "");
     else if (query[0])
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  " DGRAY "filter: " AQUA "%s" DGRAY "  (esc to clear)" RESET "\033[K\r\n", query);
     else if (album_list)
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  " DGRAY "%d %s" RESET "\033[K\r\n",
             nalbums, tab == TAB_ARTISTS ? "artists" : "albums");
     else
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  " DGRAY "%d tracks" RESET "\033[K\r\n", ntracks);
 
     /* ---- list body ---- */
     for (int i = 0; i < list_h; i++) {
         int r = scroll_top + i;
-        o += snprintf(out + o, sizeof out - o, "\033[K");
+        o = emit(out, sizeof out, o, "\033[K");
         if (r >= acount) {
             if (acount == 0 && i == 0)
-                o += snprintf(out + o, sizeof out - o,
+                o = emit(out, sizeof out, o,
                     "  " DGRAY "%s" RESET "\r\n",
                     query[0] ? "No matches." :
                     (album_list ? (tab == TAB_ARTISTS ? "No artists." : "No albums.")
                                 : "No tracks."));
             else
-                o += snprintf(out + o, sizeof out - o, "\r\n");
+                o = emit(out, sizeof out, o, "\r\n");
             continue;
         }
 
@@ -747,11 +924,11 @@ static void draw(void) {
             int nw = cols - 12;
             if (nw < 8) nw = 8;
             if (r == alsel)
-                o += snprintf(out + o, sizeof out - o,
+                o = emit(out, sizeof out, o,
                     INVAQ " %-*.*s %6s " RESET "\r\n",
                     nw, nw, *an ? an : "(unknown)", cbuf);
             else
-                o += snprintf(out + o, sizeof out - o,
+                o = emit(out, sizeof out, o,
                     " " WHITE "%-*.*s" RESET " " DGRAY "%6s" RESET "\r\n",
                     nw, nw, *an ? an : "(unknown)", cbuf);
             continue;
@@ -773,21 +950,21 @@ static void draw(void) {
         const char *title = disp_title(t);
 
         if (r == sel) {
-            o += snprintf(out + o, sizeof out - o,
+            o = emit(out, sizeof out, o,
                 INVAQ " %s%s %-*.*s %5s " RESET "\r\n",
                 marker, num, name_w, name_w, title, dbuf);
         } else {
             const char *col = (idx == cur) ? AQUA : WHITE;
-            o += snprintf(out + o, sizeof out - o,
+            o = emit(out, sizeof out, o,
                 " %s%s" DGRAY "%s " RESET "%s%-*.*s" RESET " " DGRAY "%5s" RESET "\r\n",
                 col, marker, num, col, name_w, name_w, title, dbuf);
         }
     }
 
     /* footer */
-    o += snprintf(out + o, sizeof out - o, DGRAY);
-    for (int i = 0; i < cols && i < 200; i++) out[o++] = '-';
-    o += snprintf(out + o, sizeof out - o, RESET "\033[K\r\n");
+    o = emit(out, sizeof out, o, DGRAY);
+    for (int i = 0; i < cols && i < 200 && o < (int)sizeof out - 1; i++) out[o++] = '-';
+    o = emit(out, sizeof out, o, RESET "\033[K\r\n");
 
     if (cur >= 0) {
         double el = elapsed(), dur = tracks[cur].dur;
@@ -803,7 +980,7 @@ static void draw(void) {
                      disp_title(&tracks[cur]), tracks[cur].artist);
         else
             snprintf(now, sizeof now, "%s", disp_title(&tracks[cur]));
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  %s" RESET " " WHITE "%-*.*s" RESET "\033[K\r\n",
             state, cols - 14, cols - 14, now);
 
@@ -813,27 +990,27 @@ static void draw(void) {
         int fill = (dur > 0) ? (int)(bar_w * (el / dur)) : 0;
         if (fill > bar_w) fill = bar_w;
         if (fill < 0) fill = 0;
-        o += snprintf(out + o, sizeof out - o, "  " GRAY "%5s " AQUA, e);
-        for (int i = 0; i < fill; i++)      o += snprintf(out + o, sizeof out - o, "\xE2\x96\x88");
-        o += snprintf(out + o, sizeof out - o, DGRAY);
-        for (int i = fill; i < bar_w; i++)  o += snprintf(out + o, sizeof out - o, "\xE2\x94\x80");
-        o += snprintf(out + o, sizeof out - o, " " GRAY "%5s" RESET "\033[K\r\n", d);
+        o = emit(out, sizeof out, o, "  " GRAY "%5s " AQUA, e);
+        for (int i = 0; i < fill; i++)      o = emit(out, sizeof out, o, "\xE2\x96\x88");
+        o = emit(out, sizeof out, o, DGRAY);
+        for (int i = fill; i < bar_w; i++)  o = emit(out, sizeof out, o, "\xE2\x94\x80");
+        o = emit(out, sizeof out, o, " " GRAY "%5s" RESET "\033[K\r\n", d);
     } else {
-        o += snprintf(out + o, sizeof out - o, "  " GRAY "Nothing playing" RESET "\033[K\r\n");
-        o += snprintf(out + o, sizeof out - o, "\033[K\r\n");
+        o = emit(out, sizeof out, o, "  " GRAY "Nothing playing" RESET "\033[K\r\n");
+        o = emit(out, sizeof out, o, "\033[K\r\n");
     }
 
     /* help line */
     if (searching)
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  " DGRAY "type to filter   " DGRAY "\xE2\x86\xB5" GRAY " keep  "
             DGRAY "esc" GRAY " clear  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move" RESET "\033[K");
     else if (on_album_list())
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " open  "
             DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "/" GRAY " search  " DGRAY "q" GRAY " quit" RESET "\033[K");
     else
-        o += snprintf(out + o, sizeof out - o,
+        o = emit(out, sizeof out, o,
             "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5/space" GRAY " play  "
             DGRAY "n/b" GRAY " next/prev  " DGRAY "\xE2\x86\x90\xE2\x86\x92" GRAY " seek  "
             DGRAY "-/+" GRAY " vol %d%%  " DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "/" GRAY " search  "
@@ -843,38 +1020,80 @@ static void draw(void) {
             repeat == REP_ALL ? AQUA " all" GRAY : repeat == REP_ONE ? AQUA " one" GRAY : "",
             in_album ? DGRAY "esc" GRAY " back  " : "");
 
-    o += snprintf(out + o, sizeof out - o, "\033[J");   /* clear below */
+    o = emit(out, sizeof out, o, "\033[J");   /* clear below */
 
-    if (write(STDOUT_FILENO, out, o) < 0) { /* terminal closed */ }
+    write_all(out, o);
 }
 
 /* ---- input ---- */
+enum {
+    KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT,   /* arrows (CSI and SS3) */
+    KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN,
+    KEY_IGNORE = -2                                /* consumed, no action */
+};
+
+static int read_byte(void) {
+    unsigned char c;
+    return (read(STDIN_FILENO, &c, 1) == 1) ? c : -1;
+}
+
+/* Read one key: a single byte, a lone Esc, or a decoded CSI/SS3 sequence.
+ * Unknown sequences (Home variants, F-keys, mouse reports, modifiers) are
+ * consumed whole and returned as KEY_IGNORE instead of masquerading as Esc
+ * and leaking their tail bytes as garbage keystrokes. */
 static int read_key(void) {
     static int pending = -1;            /* one-byte pushback */
     if (pending >= 0) { int p = pending; pending = -1; return p; }
 
-    unsigned char c;
-    int n = read(STDIN_FILENO, &c, 1);
-    if (n <= 0) return -1;
-    if (c == '\033') {
-        unsigned char s0;
-        if (read(STDIN_FILENO, &s0, 1) != 1) return '\033';   /* lone Esc */
-        if (s0 != '[') { pending = s0; return '\033'; }       /* Esc + other key */
-        unsigned char s1;
-        if (read(STDIN_FILENO, &s1, 1) != 1) return '\033';
-        switch (s1) {
-            case 'A': return 1000; /* up */
-            case 'B': return 1001; /* down */
-            case 'C': return 1002; /* right */
-            case 'D': return 1003; /* left */
+    int c = read_byte();
+    if (c < 0) return -1;
+    if (c != '\033') return c;
+
+    int s0 = read_byte();
+    if (s0 < 0) return '\033';                                  /* lone Esc */
+    if (s0 != '[' && s0 != 'O') { pending = s0; return '\033'; } /* Alt+key */
+
+    /* CSI '[' / SS3 'O': parameter bytes, then one final byte */
+    int num = 0, b;
+    while ((b = read_byte()) >= 0) {
+        if (b >= '0' && b <= '9') { num = num * 10 + (b - '0'); continue; }
+        if (b == ';' || b == '<' || b == '>' || b == '?' || b == ':' || b == ' ') {
+            num = 0;                     /* sub-parameter: start a new number */
+            continue;
         }
-        return '\033';
+        if (s0 == 'O')
+            switch (b) {
+                case 'A': return KEY_UP;
+                case 'B': return KEY_DOWN;
+                case 'C': return KEY_RIGHT;
+                case 'D': return KEY_LEFT;
+                default:  return KEY_IGNORE;
+            }
+        switch (b) {
+            case 'A': return KEY_UP;
+            case 'B': return KEY_DOWN;
+            case 'C': return KEY_RIGHT;
+            case 'D': return KEY_LEFT;
+            case 'H': return KEY_HOME;
+            case 'F': return KEY_END;
+            case '~':
+                switch (num) {
+                    case 1: case 7: return KEY_HOME;
+                    case 4: case 8: return KEY_END;
+                    case 5: return KEY_PGUP;
+                    case 6: return KEY_PGDN;
+                    default:  return KEY_IGNORE;   /* Ins, Del, F-keys */
+                }
+            default: return KEY_IGNORE;            /* mouse, modifiers, ... */
+        }
     }
-    return c;
+    return KEY_IGNORE;   /* sequence cut short */
 }
 
 static volatile sig_atomic_t resized = 0;
+static volatile sig_atomic_t g_stop = 0;   /* set by SIGINT/SIGTERM/SIGHUP */
 static void on_winch(int s) { (void)s; resized = 1; }
+static void on_stop(int s) { (void)s; g_stop = 1; }
 
 int main(int argc, char **argv) {
     const char *dir = (argc > 1) ? argv[1] : ".";
@@ -897,26 +1116,32 @@ int main(int argc, char **argv) {
     load_cache();
     for (int i = 0; i < ntracks; i++) {
         CacheEnt *e = cache_lookup(tracks[i].abspath, tracks[i].mtime);
-        if (e && e->dur > 0) {
-            tracks[i].dur = e->dur;
+        if (e) {
+            tracks[i].dur = e->dur;          /* may be -1: probed, no duration */
             tracks[i].trackno = e->trackno;
             tracks[i].title  = e->title  ? xstrdup(e->title)  : NULL;
             tracks[i].artist = e->artist ? xstrdup(e->artist) : NULL;
             tracks[i].album  = e->album  ? xstrdup(e->album)  : NULL;
+            tracks[i].probed = 1;            /* cached: don't probe again */
             apply_group(&tracks[i]);
         }
     }
 
     srand((unsigned)time(NULL));
-    queue = malloc(ntracks * sizeof(int));
-    if (!queue) { perror("malloc"); return 1; }
+    queue = xmalloc(ntracks * sizeof(int));
     rebuild_view();   /* initial view = all tracks; also builds the queue */
     build_albums();   /* album list for the Albums tab */
 
-    have_pactl = (system("command -v pactl >/dev/null 2>&1") == 0);
+    detect_vol_backend();
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGWINCH, on_winch);
+    /* ^C (and TERM/HUP) must leave via the normal exit path: dying by
+     * default action would leave the terminal raw, ffplay running, and
+     * the metadata cache unsaved. */
+    signal(SIGINT, on_stop);
+    signal(SIGTERM, on_stop);
+    signal(SIGHUP, on_stop);
 
     term_raw();
     printf("\033[2J");
@@ -931,9 +1156,9 @@ int main(int argc, char **argv) {
     double last_draw = 0;
 
     int running = 1;
-    while (running) {
+    while (running && !g_stop) {
         /* reap a naturally-finished track -> advance */
-        if (child > 0) {
+        if (child > 0 && !g_stop) {
             int st;
             pid_t r = waitpid(child, &st, WNOHANG);
             if (r == child) {
@@ -945,16 +1170,20 @@ int main(int argc, char **argv) {
             }
         }
 
+        volume_tick();   /* debounced volume restarts, live-volume retries */
+
         if (resized) { resized = 0; printf("\033[2J"); fflush(stdout); }
 
         int probing = probe_idx < ntracks;
 
         /* While probing, don't block in select — keep input snappy but make
-         * steady progress on durations. Once done, idle at a 250ms refresh. */
+         * steady progress on durations. Once done, idle at a 250ms refresh
+         * (50ms while a volume change is still waiting on the stream). */
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(STDIN_FILENO, &fds);
-        struct timeval tv = { 0, probing ? 0 : 250000 };
+        int vwait = (vol_dirty || restart_at > 0);
+        struct timeval tv = { 0, probing ? 0 : vwait ? 50000 : 250000 };
         int rv = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
 
         if (rv > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
@@ -963,10 +1192,30 @@ int main(int argc, char **argv) {
             if (searching) {
                 /* ---- search input mode (filters the active list) ---- */
                 switch (k) {
-                    case 1000: if (alist) { if (alsel > 0) alsel--; }
-                               else      { if (sel > 0) sel--; } break;
-                    case 1001: if (alist) { if (alsel < nalview - 1) alsel++; }
-                               else      { if (sel < nview - 1) sel++; } break;
+                    case KEY_UP:
+                        if (alist) { if (alsel > 0) alsel--; }
+                        else      { if (sel > 0) sel--; } break;
+                    case KEY_DOWN:
+                        if (alist) { if (alsel < nalview - 1) alsel++; }
+                        else      { if (sel < nview - 1) sel++; } break;
+                    case KEY_HOME:
+                        if (alist) alsel = 0; else sel = 0; break;
+                    case KEY_END:
+                        if (alist) alsel = nalview ? nalview - 1 : 0;
+                        else sel = nview ? nview - 1 : 0;
+                        break;
+                    case KEY_PGUP:
+                        if (alist) alsel = alsel > page_size ? alsel - page_size : 0;
+                        else sel = sel > page_size ? sel - page_size : 0;
+                        break;
+                    case KEY_PGDN:
+                        if (alist)
+                            alsel = alsel + page_size < nalview
+                                  ? alsel + page_size : (nalview ? nalview - 1 : 0);
+                        else
+                            sel = sel + page_size < nview
+                                ? sel + page_size : (nview ? nview - 1 : 0);
+                        break;
                     case '\r': case '\n':
                         searching = 0;                               /* keep filter */
                         if (alist) { if (nalview > 0) open_album(alview[alsel]); }
@@ -979,7 +1228,10 @@ int main(int argc, char **argv) {
                         if (qlen > 0) { query[--qlen] = '\0'; apply_query(); }
                         break;
                     default:
-                        if (k >= 32 && k < 127 && qlen < (int)sizeof(query) - 1) {
+                        /* printable ASCII and UTF-8 bytes; decoded KEY_* codes
+                         * (1000+) never reach this branch */
+                        if (k >= 32 && k < 256 && k != 127 &&
+                            qlen < (int)sizeof(query) - 1) {
                             query[qlen++] = (char)k; query[qlen] = '\0';
                             apply_query();
                         }
@@ -988,23 +1240,28 @@ int main(int argc, char **argv) {
             } else if (alist) {
                 /* ---- album list ---- */
                 switch (k) {
-                    case 1000: case 'k': if (alsel > 0) alsel--; break;
-                    case 1001: case 'j': if (alsel < nalview - 1) alsel++; break;
-                    case '\r': case '\n': case 1002: /* enter / right -> open */
+                    case KEY_UP: case 'k': if (alsel > 0) alsel--; break;
+                    case KEY_DOWN: case 'j': if (alsel < nalview - 1) alsel++; break;
+                    case '\r': case '\n': case KEY_RIGHT: /* enter / right -> open */
                         if (nalview > 0) open_album(alview[alsel]);
                         break;
+                    case KEY_HOME: case 'g': alsel = 0; break;
+                    case KEY_END: case 'G': alsel = nalview ? nalview - 1 : 0; break;
+                    case KEY_PGUP:
+                        alsel = alsel > page_size ? alsel - page_size : 0; break;
+                    case KEY_PGDN:
+                        alsel = alsel + page_size < nalview
+                              ? alsel + page_size : (nalview ? nalview - 1 : 0); break;
                     case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
                     case '/': searching = 1; break;
                     case '\033': if (query[0]) { clear_query(); rebuild_albums_view(); } break;
-                    case 'g': alsel = 0; break;
-                    case 'G': alsel = nalview ? nalview - 1 : 0; break;
-                    case 'q': case 3: running = 0; break;
+                    case 'q': running = 0; break;
                 }
             } else {
                 /* ---- track list (Tracks tab or an opened album) ---- */
                 switch (k) {
-                    case 1000: case 'k': if (sel > 0) sel--; break;
-                    case 1001: case 'j': if (sel < nview - 1) sel++; break;
+                    case KEY_UP: case 'k': if (sel > 0) sel--; break;
+                    case KEY_DOWN: case 'j': if (sel < nview - 1) sel++; break;
                     case '\r': case '\n': if (nview > 0) play_track(view[sel], 0); break;
                     case ' ': case 'p':
                         if (cur < 0) { if (nview > 0) play_track(view[sel], 0); }
@@ -1012,8 +1269,8 @@ int main(int argc, char **argv) {
                         break;
                     case 'n': next_track(); break;
                     case 'b': prev_track(); break;
-                    case 1002: seek(5); break;    /* right */
-                    case 1003: seek(-5); break;   /* left */
+                    case KEY_RIGHT: seek(5); break;
+                    case KEY_LEFT: seek(-5); break;
                     case '-': case '_': set_volume(-5); break;
                     case '+': case '=': set_volume(5); break;
                     case 'r': repeat = (repeat + 1) % 3; break;
@@ -1024,9 +1281,14 @@ int main(int argc, char **argv) {
                         if (query[0]) { clear_query(); rebuild_view(); }
                         else if (in_album) back_to_albums();
                         break;
-                    case 'g': sel = 0; break;
-                    case 'G': sel = nview ? nview - 1 : 0; break;
-                    case 'q': case 3: running = 0; break;
+                    case KEY_HOME: case 'g': sel = 0; break;
+                    case KEY_END: case 'G': sel = nview ? nview - 1 : 0; break;
+                    case KEY_PGUP:
+                        sel = sel > page_size ? sel - page_size : 0; break;
+                    case KEY_PGDN:
+                        sel = sel + page_size < nview
+                            ? sel + page_size : (nview ? nview - 1 : 0); break;
+                    case 'q': running = 0; break;
                 }
             }
             draw();
@@ -1034,14 +1296,14 @@ int main(int argc, char **argv) {
             continue;   /* respond to the key immediately */
         }
 
-        /* probe a small batch of *uncached* tracks this tick. Cached tracks
+        /* probe a small batch of unprobed tracks this tick. Cached tracks
          * already have metadata, so they're skipped instantly. */
         if (probing) {
             int probed = 0;
             while (probed < 4 && probe_idx < ntracks) {
-                if (tracks[probe_idx].dur < 0) {
-                    probe_meta(&tracks[probe_idx]);
-                    probed_new += (tracks[probe_idx].dur > 0);
+                if (!tracks[probe_idx].probed) {
+                    tracks[probe_idx].probed = probe_meta(&tracks[probe_idx]);
+                    probed_new += tracks[probe_idx].probed;
                     probed++;
                 }
                 probe_idx++;

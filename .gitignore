@@ -1,5 +1,6 @@
 # compiled binary
 /aqua
+/aqua.exe
 
 # objects
 *.o
