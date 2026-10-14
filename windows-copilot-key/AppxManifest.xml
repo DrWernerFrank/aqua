@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap uap3 rescap">
+
+  <Identity Name="aqua.player"
+            Publisher="CN=aqua-player"
+            Version="1.0.0.0"
+            ProcessorArchitecture="neutral"/>
+
+  <Properties>
+    <DisplayName>aqua</DisplayName>
+    <PublisherDisplayName>aqua</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22621.0" MaxVersionTested="10.0.26200.0"/>
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us"/>
+  </Resources>
+
+  <Applications>
+    <Application Id="aqua"
+                 Executable="AquaKeyLauncher.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          DisplayName="aqua"
+          Description="aqua - terminal music player"
+          BackgroundColor="#101418"
+          Square44x44Logo="Assets\Square44x44Logo.png"
+          Square150x150Logo="Assets\Square150x150Logo.png"/>
+      <Extensions>
+        <!-- registers this package as a Copilot hardware-key provider:
+             this is what makes aqua appear in Settings > Custom -->
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension Name="com.microsoft.windows.copilotkeyprovider"
+                              Id="aqua"
+                              DisplayName="aqua"
+                              Description="Terminal music player"
+                              PublicFolder="Public">
+            <uap3:Properties>
+              <SingleTap>aqua-copilothotkey://?state=Tap</SingleTap>
+              <PressAndHoldStart>aqua-copilothotkey://?state=Down</PressAndHoldStart>
+              <PressAndHoldStop>aqua-copilothotkey://?state=Up</PressAndHoldStop>
+            </uap3:Properties>
+          </uap3:AppExtension>
+        </uap3:Extension>
+        <!-- the system activates Copilot key providers via this URI scheme -->
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="aqua-copilothotkey">
+            <uap:DisplayName>aqua Copilot key activation</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust"/>
+  </Capabilities>
+</Package>

@@ -8,3 +8,6 @@
 # editor / local tooling
 .claude/
 *.swp
+
+# Windows Copilot-key package build output
+windows-copilot-key/build/
