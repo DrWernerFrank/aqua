@@ -116,21 +116,40 @@ static const char *browse_label(void) {
     return tab == TAB_ARTISTS ? "Artists" : tab == TAB_FOLDERS ? "Folders" : "Albums";
 }
 
-/* ---- settings: accent colour ----
- * The palette macros above carry the default accent (256-colour 44). A custom
- * accent is stored as an SGR colour parameter and swapped in by apply_theme()
- * as each line is flushed, so every AQUA in the UI follows it. */
-enum { SET_ACCENT, SET_RESET, SET_COUNT };
-#define ACCENT_DEFAULT "44"
+/* ---- settings ----
+ * Colours: the palette macros above carry the defaults (accent 44, text 252,
+ * terminal background). Custom colours are stored as SGR parameters and
+ * swapped in by apply_theme() as each line is flushed, so the whole UI
+ * follows them. Everything here is saved to the settings file. */
+enum { SET_ACCENT, SET_BG, SET_TEXT,          /* colour rows: index col[] */
+       SET_SEEK, SET_VOLSTEP, SET_START, SET_RESET, SET_COUNT };
+static const char *const set_names[SET_COUNT] = {
+    "Accent color", "Background color", "Text color",
+    "Seek step", "Volume step", "Start on tab", "Reset all settings"
+};
+typedef struct {
+    char code[12];        /* as shown to the user */
+    char sgr[24];         /* what the terminal gets ("" = terminal default) */
+    const char *def;      /* default code */
+    int  bg;              /* 1 = background (SGR 48), 0 = foreground (38) */
+} Color;
+static Color col[3] = {
+    { "44",      "38;5;44",  "44",      0 },
+    { "default", "",         "default", 1 },
+    { "252",     "38;5;252", "252",     0 },
+};
+static int  seek_step = 5;               /* seconds per arrow-key seek */
+static int  vol_step  = 5;               /* percent per volume keypress */
+static int  start_tab = TAB_TRACKS;      /* tab shown at launch */
 static int  setsel = 0;                  /* selection in the Settings tab */
 static int  editing = 0;                 /* 1 while typing a colour code */
 static char ebuf[12] = "";               /* the code being typed */
 static int  elen = 0;
-static char eprev[12] = "";              /* accent to restore if editing is cancelled */
+static char eprev[12] = "";              /* colour to restore if editing is cancelled */
 static const char *set_msg = "";         /* feedback for the last change */
-static char accent_code[12] = ACCENT_DEFAULT;   /* as shown to the user */
-static char accent_sgr[24]  = "38;5;44";        /* what the terminal gets */
+static int  force_full = 0;              /* colours changed: repaint every line */
 static char settings_file[PATH_MAX];
+static int  shuffle, repeat;             /* playback modes (defined below), saved too */
 
 static int hexval(int c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -139,13 +158,21 @@ static int hexval(int c) {
     return -1;
 }
 
-/* accept "#rrggbb" / "rrggbb" / "#rgb" (true colour) or "0".."255" (256-colour
- * palette index). Returns 1 and updates the accent, or 0 if the code is bad. */
-static int set_accent(const char *code) {
+/* accept "#rrggbb" / "rrggbb" / "#rgb" (true colour), "0".."255" (256-colour
+ * palette index) or "default". Returns 1 and updates the colour, or 0 if the
+ * code is bad. */
+static int set_color(Color *c, const char *code) {
+    if (strcasecmp(code, "default") == 0) code = c->def;
+    if (strcmp(code, "default") == 0) {          /* terminal's own background */
+        c->sgr[0] = '\0';
+        snprintf(c->code, sizeof c->code, "default");
+        force_full = 1;
+        return 1;
+    }
     int hash = (*code == '#');
     const char *p = code + hash;
     size_t L = strlen(p);
-    int h[6], dec = 1;
+    int h[6], dec = 1, base = c->bg ? 48 : 38;
     if (L == 0 || L > 6) return 0;
     for (size_t i = 0; i < L; i++) {
         if ((h[i] = hexval((unsigned char)p[i])) < 0) return 0;
@@ -155,18 +182,36 @@ static int set_accent(const char *code) {
         int r, g, b;
         if (L == 6) { r = h[0] * 16 + h[1]; g = h[2] * 16 + h[3]; b = h[4] * 16 + h[5]; }
         else        { r = h[0] * 17;        g = h[1] * 17;        b = h[2] * 17; }
-        snprintf(accent_sgr, sizeof accent_sgr, "38;2;%d;%d;%d", r, g, b);
-        snprintf(accent_code, sizeof accent_code, "#%02x%02x%02x", r, g, b);
+        snprintf(c->sgr, sizeof c->sgr, "%d;2;%d;%d;%d", base, r, g, b);
+        snprintf(c->code, sizeof c->code, "#%02x%02x%02x", r, g, b);
+        force_full = 1;
         return 1;
     }
     if (!hash && dec && L <= 3) {
         int n = atoi(p);
         if (n > 255) return 0;
-        snprintf(accent_sgr, sizeof accent_sgr, "38;5;%d", n);
-        snprintf(accent_code, sizeof accent_code, "%d", n);
+        snprintf(c->sgr, sizeof c->sgr, "%d;5;%d", base, n);
+        snprintf(c->code, sizeof c->code, "%d", n);
+        force_full = 1;
         return 1;
     }
     return 0;
+}
+
+static const int seek_opts[] = { 5, 10, 15, 30, 60 };
+static const int vol_opts[]  = { 1, 2, 5, 10 };
+
+/* step to the next/previous allowed value (unknown values snap to the first) */
+static int cycle_opt(const int *opts, int n, int v, int dir) {
+    int i = 0;
+    while (i < n && opts[i] != v) i++;
+    if (i == n) return opts[0];
+    return opts[(i + dir + n) % n];
+}
+
+static const char *tab_name(int t) {
+    static const char *const names[] = { "Tracks", "Albums", "Folders", "Artists" };
+    return (t >= 0 && t < 4) ? names[t] : names[0];
 }
 
 static void load_settings(void) {
@@ -175,7 +220,19 @@ static void load_settings(void) {
     char ln[128];
     while (fgets(ln, sizeof ln, f)) {
         ln[strcspn(ln, "\r\n")] = '\0';
-        if (strncmp(ln, "accent=", 7) == 0) set_accent(ln + 7);
+        char *eq = strchr(ln, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char *v = eq + 1;
+        int n = atoi(v);
+        if      (!strcmp(ln, "accent"))     set_color(&col[SET_ACCENT], v);
+        else if (!strcmp(ln, "background")) set_color(&col[SET_BG], v);
+        else if (!strcmp(ln, "text"))       set_color(&col[SET_TEXT], v);
+        else if (!strcmp(ln, "seek"))       seek_step = cycle_opt(seek_opts, 5, n, 0);
+        else if (!strcmp(ln, "volstep"))    vol_step  = cycle_opt(vol_opts, 4, n, 0);
+        else if (!strcmp(ln, "start"))      { if (n >= 0 && n < 4) start_tab = n; }
+        else if (!strcmp(ln, "shuffle"))    shuffle = (n != 0);
+        else if (!strcmp(ln, "repeat"))     { if (n >= 0 && n < 3) repeat = n; }
     }
     fclose(f);
 }
@@ -183,8 +240,30 @@ static void load_settings(void) {
 static void save_settings(void) {
     FILE *f = fopen(settings_file, "w");
     if (!f) return;
-    fprintf(f, "accent=%s\n", accent_code);
+    fprintf(f, "accent=%s\nbackground=%s\ntext=%s\n",
+            col[SET_ACCENT].code, col[SET_BG].code, col[SET_TEXT].code);
+    fprintf(f, "seek=%d\nvolstep=%d\nstart=%d\nshuffle=%d\nrepeat=%d\n",
+            seek_step, vol_step, start_tab, shuffle, repeat);
     fclose(f);
+}
+
+/* change the selected option row by one step (dir = +1 / -1) */
+static void setting_step(int dir) {
+    switch (setsel) {
+        case SET_SEEK:    seek_step = cycle_opt(seek_opts, 5, seek_step, dir); break;
+        case SET_VOLSTEP: vol_step  = cycle_opt(vol_opts, 4, vol_step, dir); break;
+        case SET_START:   start_tab = (start_tab + dir + 4) % 4; break;
+        default: return;
+    }
+    set_msg = "saved";
+    save_settings();
+}
+
+static void settings_reset(void) {
+    for (int i = 0; i < 3; i++) set_color(&col[i], col[i].def);
+    seek_step = 5; vol_step = 5; start_tab = TAB_TRACKS;
+    set_msg = "all settings reset";
+    save_settings();
 }
 
 /* ---- child (ffplay) control, Windows edition ---- */
@@ -759,6 +838,7 @@ static void term_raw(void) {
 }
 
 static void term_restore(void) {
+    if (col[SET_BG].sgr[0]) printf("\033[0m\033[2J\033[H");   /* don't leave our background behind */
     printf("\033[?25h\033[0m\r\n");  /* show cursor */
     fflush(stdout);
     if (hOut != INVALID_HANDLE_VALUE) SetConsoleMode(hOut, orig_out_mode);
@@ -1249,18 +1329,27 @@ static void delta_flush(Delta *del) {
     if (del->n) { fwrite(del->buf, 1, (size_t)del->n, stdout); fflush(stdout); del->n = 0; }
 }
 
-/* swap the default accent for the configured one (see settings above);
- * every screen line passes through here on its way out */
-#define THEME_SLACK 256                     /* room for longer colour codes */
+/* swap the default colours for the configured ones (see settings above);
+ * every screen line passes through here on its way out. A custom text or
+ * background colour rides on every reset, so plain text and erased cells
+ * (\033[K) pick it up too. */
+#define THEME_SLACK 1024                    /* room for longer colour codes */
 static const char *apply_theme(const char *line, char *out, size_t cap) {
-    if (strcmp(accent_sgr, "38;5;44") == 0) return line;
-    size_t al = strlen(accent_sgr), o = 0;
-    while (*line && o + al + 2 < cap) {
-        if (line[0] == '3' && strncmp(line, "38;5;44m", 8) == 0) {
-            memcpy(out + o, accent_sgr, al);
-            o += al;
-            out[o++] = 'm';
-            line += 8;
+    const char *acc = col[SET_ACCENT].sgr, *bg = col[SET_BG].sgr, *tx = col[SET_TEXT].sgr;
+    int ca = strcmp(acc, "38;5;44") != 0, ct = strcmp(tx, "38;5;252") != 0, cb = (*bg != '\0');
+    if (!ca && !ct && !cb) return line;
+    char rst[64] = "";                       /* what a reset becomes */
+    if (ct || cb)
+        snprintf(rst, sizeof rst, "\033[0;%s%s%sm", ct ? tx : "", (ct && cb) ? ";" : "", cb ? bg : "");
+    size_t rl = strlen(rst), al = strlen(acc), tl = strlen(tx), o = 0;
+    if (rl) { memcpy(out, rst, rl); o = rl; }
+    while (*line && o + 64 < cap) {
+        if (ca && line[0] == '3' && strncmp(line, "38;5;44m", 8) == 0) {
+            memcpy(out + o, acc, al); o += al; out[o++] = 'm'; line += 8;
+        } else if (ct && line[0] == '3' && strncmp(line, "38;5;252m", 9) == 0) {
+            memcpy(out + o, tx, tl); o += tl; out[o++] = 'm'; line += 9;
+        } else if (rl && line[0] == '\033' && strncmp(line, "\033[0m", 4) == 0) {
+            memcpy(out + o, rst, rl); o += rl; line += 4;
         } else out[o++] = *line++;
     }
     out[o] = '\0';
@@ -1307,7 +1396,8 @@ static void draw(void) {
 
     /* a resize changes geometry: repaint everything in place, no blanking */
     static int last_rows = -1, last_cols = -1;
-    int full = (rows != last_rows || cols != last_cols);
+    int full = (rows != last_rows || cols != last_cols || force_full);
+    force_full = 0;
     if (full) { shadow_count = 0; last_rows = rows; last_cols = cols; }
 
     Delta del = {{0}, 0, 0};                 /* bounded output chunk */
@@ -1328,8 +1418,8 @@ static void draw(void) {
     /* ---- breadcrumb / search line ---- */
     if (settings && editing)
         lo = emit(line, sizeof line, 0,
-            "  " DGRAY "Accent color code: " WHITE "%s" AQUA "\xE2\x96\x88" RESET
-            DGRAY "   #rrggbb or 0-255" RESET, ebuf);
+            "  " DGRAY "%s code: " WHITE "%s" AQUA "\xE2\x96\x88" RESET
+            DGRAY "   #rrggbb, 0-255 or default" RESET, set_names[setsel], ebuf);
     else if (settings)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "Settings%s" AQUA "%s" RESET, *set_msg ? "   " : "", set_msg);
@@ -1360,20 +1450,27 @@ static void draw(void) {
         int r = scroll_top + i;
         if (settings) {                          /* ---- settings row ---- */
             if (r < SET_COUNT) {
-                const char *name = (r == SET_ACCENT) ? "Accent color" : "Reset accent to default";
-                const char *val  = (r == SET_ACCENT) ? accent_code : ACCENT_DEFAULT;
+                char vbuf[16] = "";
+                const char *val = vbuf;
+                if (r <= SET_TEXT)           val = col[r].code;
+                else if (r == SET_SEEK)      snprintf(vbuf, sizeof vbuf, "%ds", seek_step);
+                else if (r == SET_VOLSTEP)   snprintf(vbuf, sizeof vbuf, "%d%%", vol_step);
+                else if (r == SET_START)     val = tab_name(start_tab);
                 int nw = cols - 13;
                 if (nw < 8) nw = 8;
                 if (r == setsel)
                     lo = emit(line, sizeof line, 0,
-                        INVAQ " %-*.*s %7s " RESET, nw, nw, name, val);
+                        INVAQ " %-*.*s %7s " RESET, nw, nw, set_names[r], val);
                 else
                     lo = emit(line, sizeof line, 0,
                         " " WHITE "%-*.*s" RESET " %s%7s" RESET,
-                        nw, nw, name, (r == SET_ACCENT) ? AQUA : DGRAY, val);
+                        nw, nw, set_names[r], (r == SET_ACCENT) ? AQUA : GRAY, val);
             } else if (r == SET_COUNT + 1)
                 lo = emit(line, sizeof line, 0,
-                    "  " DGRAY "Color codes: hex #rrggbb (true color) or 0-255 (256-color palette)" RESET);
+                    "  " DGRAY "Color codes: hex #rrggbb, 0-255 (256-color palette), or \"default\"" RESET);
+            else if (r == SET_COUNT + 2)
+                lo = emit(line, sizeof line, 0,
+                    "  " DGRAY "Shuffle and repeat are remembered between runs" RESET);
             else {
                 lo = 0;
                 line[0] = '\0';
@@ -1498,6 +1595,7 @@ static void draw(void) {
     else if (settings)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " change  "
+            DGRAY "\xE2\x86\x90\xE2\x86\x92" GRAY " adjust  "
             DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "q" GRAY " quit" RESET);
     else if (searching)
         lo = emit(line, sizeof line, 0,
@@ -1647,6 +1745,7 @@ int main(int argc, char **argv) {
     queue = xmalloc(ntracks * sizeof(int));
     rebuild_view();   /* initial view = all tracks; also builds the queue */
     build_albums();   /* album list for the Albums tab */
+    if (start_tab != TAB_TRACKS) switch_tab(start_tab);   /* Settings: Start on tab */
 
     SetConsoleCtrlHandler(on_console_ctrl, TRUE);
 
@@ -1686,26 +1785,29 @@ int main(int argc, char **argv) {
             int alist = on_album_list();
             if (tab == TAB_SETTINGS && editing) {
                 /* ---- typing a colour code (valid codes preview live) ---- */
+                Color *ec = &col[setsel];
                 switch (k) {
                     case '\r': case '\n':
                         editing = 0;
-                        if (elen == 0) { set_accent(eprev); break; }
-                        if (set_accent(ebuf)) { save_settings(); set_msg = "accent updated"; }
+                        if (elen == 0) { set_color(ec, eprev); break; }
+                        if (set_color(ec, ebuf)) { save_settings(); set_msg = "color updated"; }
                         else {
-                            set_accent(eprev);
-                            set_msg = "invalid code - use #rrggbb or 0-255";
+                            set_color(ec, eprev);
+                            set_msg = "invalid code - use #rrggbb, 0-255 or default";
                         }
                         break;
-                    case 27: editing = 0; set_accent(eprev); break;  /* esc: cancel */
+                    case 27: editing = 0; set_color(ec, eprev); break;   /* esc: cancel */
                     case 127: case 8:                                /* backspace */
                         if (elen > 0) ebuf[--elen] = '\0';
-                        if (!set_accent(ebuf)) set_accent(eprev);
+                        if ((ebuf[0] == '#' && elen == 4) || !set_color(ec, ebuf))
+                            set_color(ec, eprev);   /* #rgb shorthand applies on enter only */
                         break;
-                    case 3: set_accent(eprev); running = 0; break;
+                    case 3: set_color(ec, eprev); running = 0; break;
                     default:
                         if (k > 32 && k < 127 && elen < (int)sizeof(ebuf) - 1) {
                             ebuf[elen++] = (char)k; ebuf[elen] = '\0';
-                            if (!set_accent(ebuf)) set_accent(eprev);
+                            if ((ebuf[0] == '#' && elen == 4) || !set_color(ec, ebuf))
+                            set_color(ec, eprev);   /* #rgb shorthand applies on enter only */
                         }
                         break;
                 }
@@ -1714,20 +1816,22 @@ int main(int argc, char **argv) {
                 switch (k) {
                     case KEY_UP: case 'k': if (setsel > 0) setsel--; break;
                     case KEY_DOWN: case 'j': if (setsel < SET_COUNT - 1) setsel++; break;
+                    case KEY_HOME: case 'g': setsel = 0; break;
+                    case KEY_END: case 'G': setsel = SET_COUNT - 1; break;
                     case '\r': case '\n': case KEY_RIGHT:
-                        if (setsel == SET_ACCENT) {
+                        if (setsel <= SET_TEXT) {
                             editing = 1; elen = 0; ebuf[0] = '\0'; set_msg = "";
-                            snprintf(eprev, sizeof eprev, "%s", accent_code);
-                        } else {
-                            set_accent(ACCENT_DEFAULT); save_settings();
-                            set_msg = "accent reset";
-                        }
+                            snprintf(eprev, sizeof eprev, "%s", col[setsel].code);
+                        } else if (setsel == SET_RESET) {
+                            if (k != KEY_RIGHT) settings_reset();
+                        } else setting_step(1);
                         break;
+                    case KEY_LEFT: setting_step(-1); break;
                     case ' ': case 'p': if (cur >= 0) toggle_pause(); break;
                     case 'n': next_track(); break;
                     case 'b': prev_track(); break;
-                    case '-': case '_': set_volume(-5); break;
-                    case '+': case '=': set_volume(5); break;
+                    case '-': case '_': set_volume(-vol_step); break;
+                    case '+': case '=': set_volume(vol_step); break;
                     case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
                     case KEY_BTAB: switch_tab((tab + TAB_COUNT - 1) % TAB_COUNT); break;
                     case '1': case '2': case '3': case '4': case '5':
@@ -1817,12 +1921,12 @@ int main(int argc, char **argv) {
                         break;
                     case 'n': next_track(); break;
                     case 'b': prev_track(); break;
-                    case KEY_RIGHT: seek(5); break;    /* right */
-                    case KEY_LEFT: seek(-5); break;    /* left */
-                    case '-': case '_': set_volume(-5); break;
-                    case '+': case '=': set_volume(5); break;
-                    case 'r': repeat = (repeat + 1) % 3; break;
-                    case 's': shuffle = !shuffle; build_queue(); break;
+                    case KEY_RIGHT: seek(seek_step); break;    /* right */
+                    case KEY_LEFT: seek(-seek_step); break;    /* left */
+                    case '-': case '_': set_volume(-vol_step); break;
+                    case '+': case '=': set_volume(vol_step); break;
+                    case 'r': repeat = (repeat + 1) % 3; save_settings(); break;
+                    case 's': shuffle = !shuffle; build_queue(); save_settings(); break;
                     case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
                     case KEY_BTAB: switch_tab((tab + TAB_COUNT - 1) % TAB_COUNT); break;
                     case '1': case '2': case '3': case '4': case '5':

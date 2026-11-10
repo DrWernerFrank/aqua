@@ -26,9 +26,10 @@ lengths. Minimal aqua/black/gray interface, no animations.
   filename order), and an Artists browser (open an artist to see their tracks
   by album then track). Untagged files fall back to their containing folder
   name as the album
-- **Settings tab** — change the accent color by color code (`#rrggbb` hex or a
-  `0`-`255` palette index), previewed live as you type and remembered between
-  runs
+- **Settings tab** — accent, background and text colors by color code
+  (`#rrggbb` hex or a `0`-`255` palette index, previewed live as you type),
+  seek and volume step sizes, and the tab to start on; all remembered between
+  runs, along with shuffle and repeat
 - Play / pause (a true pause: `SIGSTOP`/`SIGCONT` on Linux, thread-suspend on
   Windows), next / previous, seek
 - **Volume without dropouts** — applied live, in place: through `pactl`,
@@ -120,7 +121,7 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 | `Enter`        | play selected track     |
 | `Space` / `p`  | play / pause            |
 | `n` / `b`      | next / previous         |
-| `←` / `→`      | seek −5s / +5s          |
+| `←` / `→`      | seek back / forward (5s; see Settings) |
 | `-` / `+`      | volume down / up        |
 | `/`            | search / filter         |
 | `Tab` / `Shift-Tab` | next / previous tab  |
@@ -144,15 +145,29 @@ album/folder/artist list while browsing, tracks otherwise.
 
 ### Settings
 
-The last tab. `Enter` on **Accent color** lets you type a color code:
+The last tab. `↑↓` pick a row, `Enter` changes it, `←`/`→` step option rows.
+
+| Setting | What it does |
+|---------|--------------|
+| **Accent color** | highlight color (selection, progress bar, logo); default `44` |
+| **Background color** | fills the whole UI; `default` keeps your terminal's own background |
+| **Text color** | titles and other primary text; default `252` |
+| **Seek step** | how far `←`/`→` jump: 5 / 10 / 15 / 30 / 60 seconds |
+| **Volume step** | how much `-`/`+` change: 1 / 2 / 5 / 10 % |
+| **Start on tab** | the tab aqua opens on: Tracks, Albums, Folders or Artists |
+| **Reset all settings** | back to the defaults above |
+
+Colors are typed as a code:
 
 - `#rrggbb` (or `rrggbb`, or short `#rgb`) — a true-color hex code, e.g. `#ff8800`
-- `0`-`255` — an index into the terminal's 256-color palette (the default is `44`)
+- `0`-`255` — an index into the terminal's 256-color palette
+- `default` — that color's default
 
 The whole UI previews the color as soon as the code is valid; `Enter` keeps it,
-`Esc` cancels. **Reset accent to default** restores aqua. The choice is saved to
-`~/.config/aqua/settings` on Linux and `%LOCALAPPDATA%\aqua\settings` on
-Windows. Playback keys (`Space`, `n`/`b`, `-`/`+`) keep working in this tab.
+`Esc` cancels. Shuffle and repeat are remembered between runs as well.
+Everything is saved to `~/.config/aqua/settings` on Linux and
+`%LOCALAPPDATA%\aqua\settings` on Windows. Playback keys (`Space`, `n`/`b`,
+`-`/`+`) keep working in this tab.
 
 ### Search
 
