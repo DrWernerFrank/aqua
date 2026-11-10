@@ -84,8 +84,8 @@ static char query[128] = "";
 static int qlen = 0;
 static int searching = 0;    /* 1 while typing a query */
 
-/* tabs: a flat Tracks list, plus Albums and Artists browsers */
-enum { TAB_TRACKS, TAB_ALBUMS, TAB_ARTISTS, TAB_COUNT };
+/* tabs: a flat Tracks list, Albums / Folders / Artists browsers, Settings */
+enum { TAB_TRACKS, TAB_ALBUMS, TAB_FOLDERS, TAB_ARTISTS, TAB_SETTINGS, TAB_COUNT };
 static int tab = TAB_TRACKS;
 static int in_album = 0;             /* 1 = drilled into an album's tracks */
 static char *cur_album = NULL;      /* the album currently opened (owned string) */
@@ -99,20 +99,92 @@ static int  *alview = NULL;          /* album indices matching the query */
 static int   nalview = 0;
 static int   alsel = 0;              /* selection in the album list */
 
-/* are we browsing a group list (albums/artists) vs a track list? */
+/* are we browsing a group list (albums/folders/artists) vs a track list? */
 static int on_album_list(void) {
-    return (tab == TAB_ALBUMS || tab == TAB_ARTISTS) && !in_album;
+    return (tab == TAB_ALBUMS || tab == TAB_FOLDERS || tab == TAB_ARTISTS) && !in_album;
 }
 
 /* the string a track is grouped by in the current browse tab */
 static const char *browse_key(const Track *t) {
+    if (tab == TAB_FOLDERS) return t->folder;   /* parent directory name */
     if (tab == TAB_ARTISTS) return (t->artist && *t->artist) ? t->artist : "(unknown)";
     return t->group;   /* albums (album tag, else folder) */
 }
 
 /* label for the active browse tab */
 static const char *browse_label(void) {
-    return tab == TAB_ARTISTS ? "Artists" : "Albums";
+    return tab == TAB_ARTISTS ? "Artists" : tab == TAB_FOLDERS ? "Folders" : "Albums";
+}
+
+/* ---- settings: accent colour ----
+ * The palette macros above carry the default accent (256-colour 44). A custom
+ * accent is stored as an SGR colour parameter and swapped in by apply_theme()
+ * as each line is flushed, so every AQUA in the UI follows it. */
+enum { SET_ACCENT, SET_RESET, SET_COUNT };
+#define ACCENT_DEFAULT "44"
+static int  setsel = 0;                  /* selection in the Settings tab */
+static int  editing = 0;                 /* 1 while typing a colour code */
+static char ebuf[12] = "";               /* the code being typed */
+static int  elen = 0;
+static char eprev[12] = "";              /* accent to restore if editing is cancelled */
+static const char *set_msg = "";         /* feedback for the last change */
+static char accent_code[12] = ACCENT_DEFAULT;   /* as shown to the user */
+static char accent_sgr[24]  = "38;5;44";        /* what the terminal gets */
+static char settings_file[PATH_MAX];
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* accept "#rrggbb" / "rrggbb" / "#rgb" (true colour) or "0".."255" (256-colour
+ * palette index). Returns 1 and updates the accent, or 0 if the code is bad. */
+static int set_accent(const char *code) {
+    int hash = (*code == '#');
+    const char *p = code + hash;
+    size_t L = strlen(p);
+    int h[6], dec = 1;
+    if (L == 0 || L > 6) return 0;
+    for (size_t i = 0; i < L; i++) {
+        if ((h[i] = hexval((unsigned char)p[i])) < 0) return 0;
+        if (h[i] > 9) dec = 0;
+    }
+    if (L == 6 || (hash && L == 3)) {
+        int r, g, b;
+        if (L == 6) { r = h[0] * 16 + h[1]; g = h[2] * 16 + h[3]; b = h[4] * 16 + h[5]; }
+        else        { r = h[0] * 17;        g = h[1] * 17;        b = h[2] * 17; }
+        snprintf(accent_sgr, sizeof accent_sgr, "38;2;%d;%d;%d", r, g, b);
+        snprintf(accent_code, sizeof accent_code, "#%02x%02x%02x", r, g, b);
+        return 1;
+    }
+    if (!hash && dec && L <= 3) {
+        int n = atoi(p);
+        if (n > 255) return 0;
+        snprintf(accent_sgr, sizeof accent_sgr, "38;5;%d", n);
+        snprintf(accent_code, sizeof accent_code, "%d", n);
+        return 1;
+    }
+    return 0;
+}
+
+static void load_settings(void) {
+    FILE *f = fopen(settings_file, "r");
+    if (!f) return;
+    char ln[128];
+    while (fgets(ln, sizeof ln, f)) {
+        ln[strcspn(ln, "\r\n")] = '\0';
+        if (strncmp(ln, "accent=", 7) == 0) set_accent(ln + 7);
+    }
+    fclose(f);
+}
+
+static void save_settings(void) {
+    FILE *f = fopen(settings_file, "w");
+    if (!f) return;
+    fprintf(f, "accent=%s\n", accent_code);
+    fclose(f);
 }
 
 /* ---- child (ffplay) control, Windows edition ---- */
@@ -509,6 +581,8 @@ static void init_cache_path(void) {
     _mkdir(dir);
     snprintf(cache_file, sizeof cache_file, "%.*s\\library.tsv",
              (int)(sizeof cache_file - 20), dir);
+    snprintf(settings_file, sizeof settings_file, "%.*s\\settings",
+             (int)(sizeof settings_file - 20), dir);
 }
 
 /* take the next tab-delimited field, advancing *pp past the tab */
@@ -974,7 +1048,8 @@ static int cmp_by_trackno(const Track *ta, const Track *tb) {
 /* order the view depending on context:
  *   0 = by title (Tracks tab)
  *   1 = by track number (opened album)
- *   2 = by album, then track number (opened artist) */
+ *   2 = by album, then track number (opened artist)
+ *   3 = by filename (opened folder) */
 static int cmp_view(const void *a, const void *b) {
     const Track *ta = &tracks[*(const int *)a];
     const Track *tb = &tracks[*(const int *)b];
@@ -983,6 +1058,10 @@ static int cmp_view(const void *a, const void *b) {
         int c = strcasecmp(ta->group, tb->group);
         if (c) return c;
         return cmp_by_trackno(ta, tb);
+    }
+    if (view_sort == 3) {
+        char fa[1024], fb[1024];
+        return strcasecmp(track_name(ta, fa, sizeof fa), track_name(tb, fb, sizeof fb));
     }
     char ba[1024], bb[1024];
     int c = strcasecmp(disp_title(ta, ba, sizeof ba), disp_title(tb, bb, sizeof bb));   /* Tracks tab: by title */
@@ -1003,7 +1082,7 @@ static void rebuild_view(void) {
         view[nview++] = i;
     }
     /* opened album -> by track no; opened artist -> by album then track no */
-    view_sort = !in_album ? 0 : (tab == TAB_ARTISTS ? 2 : 1);
+    view_sort = !in_album ? 0 : (tab == TAB_ARTISTS ? 2 : tab == TAB_FOLDERS ? 3 : 1);
     qsort(view, nview, sizeof(int), cmp_view);
     if (sel >= nview) sel = nview ? nview - 1 : 0;
     if (sel < 0) sel = 0;
@@ -1057,6 +1136,7 @@ static void switch_tab(int t) {
     free(cur_album); cur_album = NULL;
     searching = 0; clear_query();
     if (tab == TAB_TRACKS) rebuild_view();
+    else if (tab == TAB_SETTINGS) { setsel = 0; editing = 0; set_msg = ""; }
     else { build_albums(); rebuild_albums_view(); alsel = 0; }
 }
 
@@ -1169,9 +1249,29 @@ static void delta_flush(Delta *del) {
     if (del->n) { fwrite(del->buf, 1, (size_t)del->n, stdout); fflush(stdout); del->n = 0; }
 }
 
+/* swap the default accent for the configured one (see settings above);
+ * every screen line passes through here on its way out */
+#define THEME_SLACK 256                     /* room for longer colour codes */
+static const char *apply_theme(const char *line, char *out, size_t cap) {
+    if (strcmp(accent_sgr, "38;5;44") == 0) return line;
+    size_t al = strlen(accent_sgr), o = 0;
+    while (*line && o + al + 2 < cap) {
+        if (line[0] == '3' && strncmp(line, "38;5;44m", 8) == 0) {
+            memcpy(out + o, accent_sgr, al);
+            o += al;
+            out[o++] = 'm';
+            line += 8;
+        } else out[o++] = *line++;
+    }
+    out[o] = '\0';
+    return out;
+}
+
 /* overwrite one screen line unless its hash says it's already shown */
 static void flush_line(Delta *del, int row, const char *line) {
     if (row >= MAX_FRAME_LINES) return;
+    char themed[MAX_LINE + THEME_SLACK];
+    line = apply_theme(line, themed, sizeof themed);
     unsigned long long h = str_hash(line);
     if (row < shadow_count && shadow_hash[row] == h) return;
     if (!del->wrote) {                      /* first change opens the bracket */
@@ -1179,7 +1279,7 @@ static void flush_line(Delta *del, int row, const char *line) {
         del->wrote = 1;
     }
     del->n = emit(del->buf, sizeof del->buf, del->n, "\033[%d;1H%s\033[K", row + 1, line);
-    if (del->n > (int)sizeof del->buf - MAX_LINE - 32) delta_flush(del);
+    if (del->n > (int)sizeof del->buf - MAX_LINE - THEME_SLACK - 32) delta_flush(del);
     shadow_hash[row] = h;
 }
 
@@ -1196,8 +1296,9 @@ static void draw(void) {
     page_size = list_h;
 
     int album_list = on_album_list();
-    int asel   = album_list ? alsel   : sel;     /* active selection */
-    int acount = album_list ? nalview : nview;   /* active list length */
+    int settings = (tab == TAB_SETTINGS);
+    int asel   = settings ? setsel    : album_list ? alsel   : sel;     /* active selection */
+    int acount = settings ? SET_COUNT : album_list ? nalview : nview;   /* active list length */
 
     /* keep the active selection on screen */
     if (asel < scroll_top) scroll_top = asel;
@@ -1216,13 +1317,23 @@ static void draw(void) {
     /* ---- tab bar ---- */
     const char *t_tracks  = (tab == TAB_TRACKS)  ? INVAQ " Tracks "  RESET : DGRAY " Tracks "  RESET;
     const char *t_albums  = (tab == TAB_ALBUMS)  ? INVAQ " Albums "  RESET : DGRAY " Albums "  RESET;
+    const char *t_folders = (tab == TAB_FOLDERS) ? INVAQ " Folders " RESET : DGRAY " Folders " RESET;
     const char *t_artists = (tab == TAB_ARTISTS) ? INVAQ " Artists " RESET : DGRAY " Artists " RESET;
+    const char *t_settings = settings            ? INVAQ " Settings " RESET : DGRAY " Settings " RESET;
     lo = emit(line, sizeof line, 0,
-        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s", t_tracks, t_albums, t_artists);
+        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s%s%s",
+        t_tracks, t_albums, t_folders, t_artists, t_settings);
     flush_line(&del, row++, line);
 
     /* ---- breadcrumb / search line ---- */
-    if (searching)
+    if (settings && editing)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "Accent color code: " WHITE "%s" AQUA "\xE2\x96\x88" RESET
+            DGRAY "   #rrggbb or 0-255" RESET, ebuf);
+    else if (settings)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "Settings%s" AQUA "%s" RESET, *set_msg ? "   " : "", set_msg);
+    else if (searching)
         lo = emit(line, sizeof line, 0,
             "  " AQUA "/" WHITE "%s" AQUA "\xE2\x96\x88" RESET
             DGRAY "   %d matches" RESET, query, acount);
@@ -1238,7 +1349,7 @@ static void draw(void) {
     else if (album_list)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "%d %s" RESET,
-            nalbums, tab == TAB_ARTISTS ? "artists" : "albums");
+            nalbums, tab == TAB_ARTISTS ? "artists" : tab == TAB_FOLDERS ? "folders" : "albums");
     else
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "%d tracks" RESET, ntracks);
@@ -1247,12 +1358,36 @@ static void draw(void) {
     /* ---- list body ---- */
     for (int i = 0; i < list_h; i++) {
         int r = scroll_top + i;
+        if (settings) {                          /* ---- settings row ---- */
+            if (r < SET_COUNT) {
+                const char *name = (r == SET_ACCENT) ? "Accent color" : "Reset accent to default";
+                const char *val  = (r == SET_ACCENT) ? accent_code : ACCENT_DEFAULT;
+                int nw = cols - 13;
+                if (nw < 8) nw = 8;
+                if (r == setsel)
+                    lo = emit(line, sizeof line, 0,
+                        INVAQ " %-*.*s %7s " RESET, nw, nw, name, val);
+                else
+                    lo = emit(line, sizeof line, 0,
+                        " " WHITE "%-*.*s" RESET " %s%7s" RESET,
+                        nw, nw, name, (r == SET_ACCENT) ? AQUA : DGRAY, val);
+            } else if (r == SET_COUNT + 1)
+                lo = emit(line, sizeof line, 0,
+                    "  " DGRAY "Color codes: hex #rrggbb (true color) or 0-255 (256-color palette)" RESET);
+            else {
+                lo = 0;
+                line[0] = '\0';
+            }
+            flush_line(&del, row++, line);
+            continue;
+        }
         if (r >= acount) {
             if (acount == 0 && i == 0)
                 lo = emit(line, sizeof line, 0,
                     "  " DGRAY "%s" RESET,
                     query[0] ? "No matches." :
-                    (album_list ? (tab == TAB_ARTISTS ? "No artists." : "No albums.")
+                    (album_list ? (tab == TAB_ARTISTS ? "No artists." :
+                                   tab == TAB_FOLDERS ? "No folders." : "No albums.")
                                 : "No tracks."));
             else {
                 lo = 0;
@@ -1356,7 +1491,15 @@ static void draw(void) {
     }
 
     /* help line */
-    if (searching)
+    if (settings && editing)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "type a color code   " DGRAY "\xE2\x86\xB5" GRAY " apply  "
+            DGRAY "esc" GRAY " cancel" RESET);
+    else if (settings)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " change  "
+            DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "q" GRAY " quit" RESET);
+    else if (searching)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "type to filter   " DGRAY "\xE2\x86\xB5" GRAY " keep  "
             DGRAY "esc" GRAY " clear  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move" RESET);
@@ -1393,7 +1536,8 @@ static void draw(void) {
 /* ---- input ---- */
 enum {
     KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT,   /* arrows */
-    KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN
+    KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN,
+    KEY_BTAB                                        /* Shift-Tab */
 };
 
 /* Returns an ASCII byte, a KEY_* code, or -1 (no key / ignored key).
@@ -1413,6 +1557,7 @@ static int read_key(void) {
             case 79: return KEY_END;    /* End */
             case 73: return KEY_PGUP;   /* PgUp */
             case 81: return KEY_PGDN;   /* PgDn */
+            case 15: return KEY_BTAB;   /* Shift-Tab */
         }
         return -1;
     }
@@ -1440,6 +1585,7 @@ int main(int argc, char **argv) {
     qsort(tracks, ntracks, sizeof(Track), cmp_track);
 
     init_cache_path();
+    load_settings();
     load_cache();
 
     /* canonical paths + mtimes, then prefill durations from cache.
@@ -1538,7 +1684,57 @@ int main(int argc, char **argv) {
         if (_kbhit()) {
             int k = read_key();
             int alist = on_album_list();
-            if (searching) {
+            if (tab == TAB_SETTINGS && editing) {
+                /* ---- typing a colour code (valid codes preview live) ---- */
+                switch (k) {
+                    case '\r': case '\n':
+                        editing = 0;
+                        if (elen == 0) { set_accent(eprev); break; }
+                        if (set_accent(ebuf)) { save_settings(); set_msg = "accent updated"; }
+                        else {
+                            set_accent(eprev);
+                            set_msg = "invalid code - use #rrggbb or 0-255";
+                        }
+                        break;
+                    case 27: editing = 0; set_accent(eprev); break;  /* esc: cancel */
+                    case 127: case 8:                                /* backspace */
+                        if (elen > 0) ebuf[--elen] = '\0';
+                        if (!set_accent(ebuf)) set_accent(eprev);
+                        break;
+                    case 3: set_accent(eprev); running = 0; break;
+                    default:
+                        if (k > 32 && k < 127 && elen < (int)sizeof(ebuf) - 1) {
+                            ebuf[elen++] = (char)k; ebuf[elen] = '\0';
+                            if (!set_accent(ebuf)) set_accent(eprev);
+                        }
+                        break;
+                }
+            } else if (tab == TAB_SETTINGS) {
+                /* ---- settings list ---- */
+                switch (k) {
+                    case KEY_UP: case 'k': if (setsel > 0) setsel--; break;
+                    case KEY_DOWN: case 'j': if (setsel < SET_COUNT - 1) setsel++; break;
+                    case '\r': case '\n': case KEY_RIGHT:
+                        if (setsel == SET_ACCENT) {
+                            editing = 1; elen = 0; ebuf[0] = '\0'; set_msg = "";
+                            snprintf(eprev, sizeof eprev, "%s", accent_code);
+                        } else {
+                            set_accent(ACCENT_DEFAULT); save_settings();
+                            set_msg = "accent reset";
+                        }
+                        break;
+                    case ' ': case 'p': if (cur >= 0) toggle_pause(); break;
+                    case 'n': next_track(); break;
+                    case 'b': prev_track(); break;
+                    case '-': case '_': set_volume(-5); break;
+                    case '+': case '=': set_volume(5); break;
+                    case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
+                    case KEY_BTAB: switch_tab((tab + TAB_COUNT - 1) % TAB_COUNT); break;
+                    case '1': case '2': case '3': case '4': case '5':
+                        switch_tab(k - '1'); break;       /* jump straight to a tab */
+                    case 'q': case 3: running = 0; break;
+                }
+            } else if (searching) {
                 /* ---- search input mode (filters the active list) ---- */
                 switch (k) {
                     case KEY_UP:
@@ -1602,6 +1798,9 @@ int main(int argc, char **argv) {
                         alsel = alsel + page_size < nalview
                               ? alsel + page_size : (nalview ? nalview - 1 : 0); break;
                     case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
+                    case KEY_BTAB: switch_tab((tab + TAB_COUNT - 1) % TAB_COUNT); break;
+                    case '1': case '2': case '3': case '4': case '5':
+                        switch_tab(k - '1'); break;       /* jump straight to a tab */
                     case '/': searching = 1; break;
                     case 27: if (query[0]) { clear_query(); rebuild_albums_view(); } break;
                     case 'q': case 3: running = 0; break;   /* Ctrl-C = byte 3 here */
@@ -1625,6 +1824,9 @@ int main(int argc, char **argv) {
                     case 'r': repeat = (repeat + 1) % 3; break;
                     case 's': shuffle = !shuffle; build_queue(); break;
                     case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
+                    case KEY_BTAB: switch_tab((tab + TAB_COUNT - 1) % TAB_COUNT); break;
+                    case '1': case '2': case '3': case '4': case '5':
+                        switch_tab(k - '1'); break;       /* jump straight to a tab */
                     case '/': searching = 1; break;
                     case 27:                      /* esc: clear filter, else leave album */
                         if (query[0]) { clear_query(); rebuild_view(); }

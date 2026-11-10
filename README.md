@@ -20,10 +20,15 @@ lengths. Minimal aqua/black/gray interface, no animations.
 
 - Recursively scans a folder for audio (`mp3 flac ogg wav m4a aac opus wma ...`)
 - **Reads tags** (title, artist, album, track number)
-- **Tracks / Albums / Artists tabs** (`Tab` to cycle): a flat track list, an
-  Albums browser (open an album to see its tracks in track-number order), and an
-  Artists browser (open an artist to see their tracks by album then track).
-  Untagged files fall back to their containing folder name as the album
+- **Tracks / Albums / Folders / Artists tabs** (`Tab` to cycle): a flat track
+  list, an Albums browser (open an album to see its tracks in track-number
+  order), a Folders browser (your library as it sits on disk, tracks in
+  filename order), and an Artists browser (open an artist to see their tracks
+  by album then track). Untagged files fall back to their containing folder
+  name as the album
+- **Settings tab** — change the accent color by color code (`#rrggbb` hex or a
+  `0`-`255` palette index), previewed live as you type and remembered between
+  runs
 - Play / pause (a true pause: `SIGSTOP`/`SIGCONT` on Linux, thread-suspend on
   Windows), next / previous, seek
 - **Volume without dropouts** — applied live, in place: through `pactl`,
@@ -118,7 +123,8 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 | `←` / `→`      | seek −5s / +5s          |
 | `-` / `+`      | volume down / up        |
 | `/`            | search / filter         |
-| `Tab`          | cycle Tracks/Albums/Artists |
+| `Tab` / `Shift-Tab` | next / previous tab  |
+| `1`-`5`        | jump straight to a tab  |
 | `s`            | toggle shuffle          |
 | `r`            | repeat: off / all / one |
 | `g` / `G`, `Home` / `End` | jump to top / bottom |
@@ -127,12 +133,26 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 
 ### Tabs
 
-`Tab` cycles between **Tracks** (a flat list of every track), **Albums**, and
-**Artists**. In the Albums/Artists tabs, `↑↓` move between entries and `Enter`
-(or `→`) opens one — an album shows its tracks in track-number order, an artist
-shows their tracks grouped by album then track. `Esc` goes back to the list.
-Opening an album or artist makes that selection the queue, so next/prev stay
-within it. `/` filters the album/artist list while browsing, tracks otherwise.
+`Tab` cycles between **Tracks** (a flat list of every track), **Albums**,
+**Folders**, **Artists**, and **Settings** (`Shift-Tab` goes back, `1`-`5` jump
+directly). In the Albums/Folders/Artists tabs, `↑↓` move between entries and
+`Enter` (or `→`) opens one — an album shows its tracks in track-number order, a
+folder shows its files in filename order, an artist shows their tracks grouped
+by album then track. `Esc` goes back to the list. Opening an entry makes that
+selection the queue, so next/prev stay within it. `/` filters the
+album/folder/artist list while browsing, tracks otherwise.
+
+### Settings
+
+The last tab. `Enter` on **Accent color** lets you type a color code:
+
+- `#rrggbb` (or `rrggbb`, or short `#rgb`) — a true-color hex code, e.g. `#ff8800`
+- `0`-`255` — an index into the terminal's 256-color palette (the default is `44`)
+
+The whole UI previews the color as soon as the code is valid; `Enter` keeps it,
+`Esc` cancels. **Reset accent to default** restores aqua. The choice is saved to
+`~/.config/aqua/settings` on Linux and `%LOCALAPPDATA%\aqua\settings` on
+Windows. Playback keys (`Space`, `n`/`b`, `-`/`+`) keep working in this tab.
 
 ### Search
 
