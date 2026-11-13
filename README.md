@@ -26,9 +26,13 @@ lengths. Minimal aqua/black/gray interface, no animations.
   filename order), and an Artists browser (open an artist to see their tracks
   by album then track). Untagged files fall back to their containing folder
   name as the album
-- **Settings tab** — accent, background and text colors by color code
+- **Oscilloscope tab** *(experimental — off until you switch it on in
+  Settings)* — the playing track drawn live in braille dots: waveform, stereo
+  (left over right) or X-Y, with trigger and auto gain
+- **Settings tab** — the music folder, accent, background and text colors by color code
   (`#rrggbb` hex or a `0`-`255` palette index, previewed live as you type),
-  seek and volume step sizes, and the tab to start on; all remembered between
+  seek and volume step sizes, the tab to start on, and the oscilloscope's
+  options; all remembered between
   runs, along with shuffle and repeat
 - Play / pause (a true pause: `SIGSTOP`/`SIGCONT` on Linux, thread-suspend on
   Windows), next / previous, seek
@@ -55,8 +59,9 @@ lengths. Minimal aqua/black/gray interface, no animations.
 ## Requirements
 
 - A C compiler (`cc`/`gcc`) and `make`
-- [`ffmpeg`](https://ffmpeg.org/) — provides `ffplay` (playback) and
-  `ffprobe` (durations + tags)
+- [`ffmpeg`](https://ffmpeg.org/) — provides `ffplay` (playback),
+  `ffprobe` (durations + tags) and `ffmpeg` itself (samples for the
+  experimental oscilloscope)
 - Linux only, optional: `pactl` (`pulseaudio-utils`), `wpctl` or `amixer`
   for live volume. Without any of them, a volume key restarts the track at
   its current position once the keys settle — a brief gap, but never a
@@ -113,6 +118,12 @@ aqua                 # play the current directory
 aqua ~/Music         # play a specific folder (recurses into subfolders)
 ```
 
+You can also pick the folder from inside aqua: **Settings → Music folder**
+(see below). A saved folder is used whenever aqua starts without a folder
+argument, or with the same argument it had when you saved it — so a Start Menu
+shortcut or shell alias that always passes one folder keeps your choice. A
+*different* folder on the command line still wins for that run.
+
 ### Controls
 
 | Key            | Action                  |
@@ -125,7 +136,7 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 | `-` / `+`      | volume down / up        |
 | `/`            | search / filter         |
 | `Tab` / `Shift-Tab` | next / previous tab  |
-| `1`-`5`        | jump straight to a tab  |
+| `1`-`5`        | jump straight to a tab (`1`-`6` with the Scope tab on) |
 | `s`            | toggle shuffle          |
 | `r`            | repeat: off / all / one |
 | `g` / `G`, `Home` / `End` | jump to top / bottom |
@@ -136,12 +147,49 @@ aqua ~/Music         # play a specific folder (recurses into subfolders)
 
 `Tab` cycles between **Tracks** (a flat list of every track), **Albums**,
 **Folders**, **Artists**, and **Settings** (`Shift-Tab` goes back, `1`-`5` jump
-directly). In the Albums/Folders/Artists tabs, `↑↓` move between entries and
+directly). Turning on the experimental oscilloscope adds a **Scope** tab just
+before Settings (the number keys then run `1`-`6`). In the Albums/Folders/Artists tabs, `↑↓` move between entries and
 `Enter` (or `→`) opens one — an album shows its tracks in track-number order, a
 folder shows its files in filename order, an artist shows their tracks grouped
 by album then track. `Esc` goes back to the list. Opening an entry makes that
 selection the queue, so next/prev stay within it. `/` filters the
 album/folder/artist list while browsing, tracks otherwise.
+
+### Scope (experimental)
+
+**Off by default.** To turn it on, open Settings, move to **Experimental:
+oscilloscope** and press `Enter`: the Scope tab appears just before Settings,
+and its options are added to the Settings list. Switching it off (or **Reset
+all settings**) removes both again. Experimental features may still change.
+
+An oscilloscope for the playing track, drawn in braille dots (two by four
+per character cell). `m` cycles the mode, `↑`/`↓` change the time span, and
+the playback keys (`Space`, `n`/`b`, `←`/`→`, `-`/`+`, `s`, `r`) work as in a
+track list.
+
+| Mode | What it shows |
+|------|---------------|
+| **Wave** | left + right mixed into one trace |
+| **Stereo** | left channel on top, right channel below |
+| **X-Y** | left across, right up — a Lissajous / stereo-field picture |
+
+X-Y redraws the last stretch of signal every frame as one smooth curve (a
+spline through the samples), the newest part in the X color and the older tail
+in the Y color. Two things keep it a line instead of a filled blob:
+
+- **Smoothing** low-passes the signal first, so the beam follows the bass and
+  mids in open loops instead of scribbling the treble over everything.
+- The **wide** view plots what the speakers disagree on (L−R) across and what
+  they share (L+R) up, each axis scaled to fill the screen. Ordinary music is
+  nearly the same in both speakers, so the textbook **L/R** plot collapses onto
+  one diagonal; wide opens it up. Switch to L/R (and smoothing off) for a true
+  Lissajous figure, e.g. with test tones or oscilloscope music.
+
+ffplay keeps the audio to itself, so while this tab is open a second, silent
+`ffmpeg` decodes the same track to raw samples on a pipe, and aqua reads
+exactly as much as the playback clock has advanced — the picture follows the
+music through pause, seek and track changes. The decoder is stopped as soon as
+you leave the tab, so the scope costs nothing when you aren't looking at it.
 
 ### Settings
 
@@ -149,13 +197,26 @@ The last tab. `↑↓` pick a row, `Enter` changes it, `←`/`→` step option r
 
 | Setting | What it does |
 |---------|--------------|
+| **Music folder** | the folder aqua plays. `Enter`, then type or paste a path and press `Enter`: aqua checks it is a folder with audio in it, saves it and restarts on it (a bad path changes nothing). Empty or `default` goes back to the folder aqua was started on |
 | **Accent color** | highlight color (selection, progress bar, logo); default `44` |
 | **Background color** | fills the whole UI; `default` keeps your terminal's own background |
 | **Text color** | titles and other primary text; default `252` |
 | **Seek step** | how far `←`/`→` jump: 5 / 10 / 15 / 30 / 60 seconds |
 | **Volume step** | how much `-`/`+` change: 1 / 2 / 5 / 10 % |
 | **Start on tab** | the tab aqua opens on: Tracks, Albums, Folders or Artists |
-| **Reset all settings** | back to the defaults above |
+| **Experimental: oscilloscope** | `off` by default; `on` adds the Scope tab and the Scope rows below |
+| **Scope mode** | Wave / Stereo / X-Y (also `m` in the Scope tab) |
+| **Scope time span** | how much time fits across the screen (in X-Y: how long a stretch is drawn, never less than two frames): 10 / 20 / 50 / 100 / 200 ms |
+| **Scope gain** | `auto` scales the trace to fill the screen; or a fixed 1x / 2x / 4x / 8x |
+| **Scope trigger** | `on` starts each sweep at a rising zero crossing so the wave holds still |
+| **Scope style** | `braille` dots, or half `blocks` for fonts without braille glyphs |
+| **Scope frame rate** | 15 / 30 / 60 fps |
+| **Scope sync delay** | how far the picture trails the clock (0-500 ms); raise it if the picture runs ahead of the sound |
+| **Scope X-Y view** | `wide` (L−R across, L+R up, each axis scaled to fit) or `L/R` (left across, right up, true shape) |
+| **Scope X-Y smoothing** | low-pass before drawing: off / light / medium / heavy |
+| **Scope X color (left)** | color code for the wave, the left channel in Stereo, and the newest part of the X-Y curve; `default` follows the accent |
+| **Scope Y color (right)** | color code for the right channel in Stereo and the X-Y tail; `default` follows the accent |
+| **Reset all settings** | back to the defaults above (the music folder is kept) |
 
 Colors are typed as a code:
 

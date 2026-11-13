@@ -84,8 +84,9 @@ static char query[128] = "";
 static int qlen = 0;
 static int searching = 0;    /* 1 while typing a query */
 
-/* tabs: a flat Tracks list, Albums / Folders / Artists browsers, Settings */
-enum { TAB_TRACKS, TAB_ALBUMS, TAB_FOLDERS, TAB_ARTISTS, TAB_SETTINGS, TAB_COUNT };
+/* tabs: a flat Tracks list, Albums / Folders / Artists browsers, the
+ * oscilloscope, Settings */
+enum { TAB_TRACKS, TAB_ALBUMS, TAB_FOLDERS, TAB_ARTISTS, TAB_SCOPE, TAB_SETTINGS, TAB_COUNT };
 static int tab = TAB_TRACKS;
 static int in_album = 0;             /* 1 = drilled into an album's tracks */
 static char *cur_album = NULL;      /* the album currently opened (owned string) */
@@ -122,10 +123,22 @@ static const char *browse_label(void) {
  * swapped in by apply_theme() as each line is flushed, so the whole UI
  * follows them. Everything here is saved to the settings file. */
 enum { SET_ACCENT, SET_BG, SET_TEXT,          /* colour rows: index col[] */
-       SET_SEEK, SET_VOLSTEP, SET_START, SET_RESET, SET_COUNT };
+       SET_SEEK, SET_VOLSTEP, SET_START, SET_MUSIC,
+       SET_EXP_SCOPE,                                        /* experimental: oscilloscope on/off */
+       SET_SC_MODE, SET_SC_SPAN, SET_SC_GAIN, SET_SC_TRIG,   /* oscilloscope */
+       SET_SC_STYLE, SET_SC_FPS, SET_SC_DELAY,
+       SET_SC_XYVIEW, SET_SC_SMOOTH,
+       SET_SC_COLX, SET_SC_COLY,                             /* colour rows: col[3], col[4] */
+       SET_RESET, SET_COUNT };
 static const char *const set_names[SET_COUNT] = {
     "Accent color", "Background color", "Text color",
-    "Seek step", "Volume step", "Start on tab", "Reset all settings"
+    "Seek step", "Volume step", "Start on tab", "Music folder",
+    "Experimental: oscilloscope",
+    "Scope mode", "Scope time span", "Scope gain", "Scope trigger",
+    "Scope style", "Scope frame rate", "Scope sync delay",
+    "Scope X-Y view", "Scope X-Y smoothing",
+    "Scope X color (left)", "Scope Y color (right)",
+    "Reset all settings"
 };
 typedef struct {
     char code[12];        /* as shown to the user */
@@ -133,15 +146,65 @@ typedef struct {
     const char *def;      /* default code */
     int  bg;              /* 1 = background (SGR 48), 0 = foreground (38) */
 } Color;
-static Color col[3] = {
+static Color col[5] = {
     { "44",      "38;5;44",  "44",      0 },
     { "default", "",         "default", 1 },
     { "252",     "38;5;252", "252",     0 },
+    { "default", "",         "default", 0 },   /* scope X: "default" = the accent colour */
+    { "default", "",         "default", 0 },   /* scope Y */
 };
+
+/* the colour a settings row edits, or NULL for a non-colour row */
+static Color *row_color(int r) {
+    if (r >= 0 && r <= SET_TEXT) return &col[r];
+    if (r == SET_SC_COLX) return &col[3];
+    if (r == SET_SC_COLY) return &col[4];
+    return NULL;
+}
 static int  seek_step = 5;               /* seconds per arrow-key seek */
 static int  vol_step  = 5;               /* percent per volume keypress */
 static int  start_tab = TAB_TRACKS;      /* tab shown at launch */
-static int  setsel = 0;                  /* selection in the Settings tab */
+static int  setsel = 0;                  /* selection in the Settings tab: an index into set_vis[] */
+
+/* Experimental features ship switched off. The oscilloscope is one: until it
+ * is turned on in Settings there is no Scope tab and its option rows are not
+ * listed, so the app looks and behaves exactly as it does without it. */
+static int  scope_on = 0;
+static int  set_vis[SET_COUNT];          /* the setting rows currently listed, in order */
+static int  nset = 0;
+
+/* ---- music folder ----
+ * aqua plays the folder it is started on. Settings > Music folder replaces
+ * that with a saved one: it is used whenever aqua starts with no folder
+ * argument, or with the same argument it had when the folder was saved (a
+ * Start Menu shortcut or alias always passes the same one - the choice has
+ * to survive that). A different folder on the command line still wins.
+ * Changing it restarts aqua on the new folder (see the end of main()). */
+static char music_dir[PATH_MAX]  = "";   /* the saved folder; "" = none */
+static char music_from[PATH_MAX] = "";   /* the launch argument when it was saved */
+static char launch_arg[PATH_MAX] = "";   /* this run's folder argument; "" = none */
+static char lib_dir[PATH_MAX]    = ".";  /* the folder this run is playing */
+static char pbuf[1024] = "";             /* the path being typed */
+static int  plen = 0;
+static int  relaunch = 0;                /* leave the main loop and start over */
+static const char *startup_note = "";    /* why the saved folder was not used */
+
+static void settings_rows(void) {
+    nset = 0;
+    set_vis[nset++] = SET_MUSIC;         /* first: it is what people look for */
+    for (int r = 0; r < SET_COUNT; r++) {
+        if (r == SET_MUSIC) continue;
+        if (!scope_on && r >= SET_SC_MODE && r <= SET_SC_COLY) continue;
+        set_vis[nset++] = r;
+    }
+    if (setsel >= nset) setsel = nset - 1;
+}
+
+/* the SET_* row under the cursor */
+static int set_row(void) {
+    if (!nset) settings_rows();
+    return set_vis[setsel < nset ? setsel : nset - 1];
+}
 static int  editing = 0;                 /* 1 while typing a colour code */
 static char ebuf[12] = "";               /* the code being typed */
 static int  elen = 0;
@@ -201,6 +264,33 @@ static int set_color(Color *c, const char *code) {
 static const int seek_opts[] = { 5, 10, 15, 30, 60 };
 static const int vol_opts[]  = { 1, 2, 5, 10 };
 
+/* oscilloscope tab (see "oscilloscope" below) */
+static const char *const sc_mode_names[] = { "Wave", "Stereo", "X-Y" };
+static const int sc_span_opts[]  = { 10, 20, 50, 100, 200 };      /* ms across the screen */
+static const int sc_gain_opts[]  = { 0, 1, 2, 4, 8 };             /* 0 = auto */
+static const int sc_fps_opts[]   = { 15, 30, 60 };
+static const int sc_delay_opts[] = { 0, 100, 200, 300, 400, 500 };/* ms the picture trails the clock */
+static int sc_mode   = 0;      /* 0 wave (L+R), 1 stereo (L over R), 2 X-Y */
+static int sc_span   = 50;
+static int sc_gain   = 0;
+static int sc_trig   = 1;      /* hold the wave still on a rising zero crossing */
+static int sc_blocks = 0;      /* 0 = braille dots, 1 = half blocks */
+static int sc_fps    = 30;
+static int sc_delay  = 200;
+/* X-Y smoothing: the signal is low-passed before it is drawn, so the beam
+ * follows the bass and mids in flowing loops instead of scribbling the
+ * treble into a solid blob. 0 off, 1 light (2 kHz), 2 medium (700 Hz),
+ * 3 heavy (300 Hz). */
+static const char *const sc_smooth_names[] = { "off", "light", "medium", "heavy" };
+static int sc_smooth = 3;
+/* X-Y view: 0 "L/R" is the textbook plot (left across, right up) - honest,
+ * but ordinary music is nearly the same in both speakers, so it collapses
+ * onto one diagonal. 1 "wide" plots what the speakers disagree on (L-R)
+ * across and what they share (L+R) up, each axis scaled to fill the screen,
+ * which opens that diagonal up into a full figure. */
+static const char *const sc_xyview_names[] = { "L/R", "wide" };
+static int sc_xyview = 1;
+
 /* step to the next/previous allowed value (unknown values snap to the first) */
 static int cycle_opt(const int *opts, int n, int v, int dir) {
     int i = 0;
@@ -217,7 +307,7 @@ static const char *tab_name(int t) {
 static void load_settings(void) {
     FILE *f = fopen(settings_file, "r");
     if (!f) return;
-    char ln[128];
+    char ln[PATH_MAX + 32];              /* long enough for a folder path */
     while (fgets(ln, sizeof ln, f)) {
         ln[strcspn(ln, "\r\n")] = '\0';
         char *eq = strchr(ln, '=');
@@ -231,6 +321,20 @@ static void load_settings(void) {
         else if (!strcmp(ln, "seek"))       seek_step = cycle_opt(seek_opts, 5, n, 0);
         else if (!strcmp(ln, "volstep"))    vol_step  = cycle_opt(vol_opts, 4, n, 0);
         else if (!strcmp(ln, "start"))      { if (n >= 0 && n < 4) start_tab = n; }
+        else if (!strcmp(ln, "music"))      snprintf(music_dir, sizeof music_dir, "%s", v);
+        else if (!strcmp(ln, "musicfrom"))  snprintf(music_from, sizeof music_from, "%s", v);
+        else if (!strcmp(ln, "scope"))      scope_on = (n != 0);
+        else if (!strcmp(ln, "sccolx"))     set_color(&col[3], v);
+        else if (!strcmp(ln, "sccoly"))     set_color(&col[4], v);
+        else if (!strcmp(ln, "scmode"))     { if (n >= 0 && n < 3) sc_mode = n; }
+        else if (!strcmp(ln, "scspan"))     sc_span  = cycle_opt(sc_span_opts, 5, n, 0);
+        else if (!strcmp(ln, "scgain"))     sc_gain  = cycle_opt(sc_gain_opts, 5, n, 0);
+        else if (!strcmp(ln, "sctrig"))     sc_trig  = (n != 0);
+        else if (!strcmp(ln, "scstyle"))    sc_blocks = (n != 0);
+        else if (!strcmp(ln, "scfps"))      sc_fps   = cycle_opt(sc_fps_opts, 3, n, 0);
+        else if (!strcmp(ln, "scdelay"))    sc_delay = cycle_opt(sc_delay_opts, 6, n, 0);
+        else if (!strcmp(ln, "scsmooth"))   { if (n >= 0 && n < 4) sc_smooth = n; }
+        else if (!strcmp(ln, "scxyview"))   sc_xyview = (n != 0);
         else if (!strcmp(ln, "shuffle"))    shuffle = (n != 0);
         else if (!strcmp(ln, "repeat"))     { if (n >= 0 && n < 3) repeat = n; }
     }
@@ -244,15 +348,29 @@ static void save_settings(void) {
             col[SET_ACCENT].code, col[SET_BG].code, col[SET_TEXT].code);
     fprintf(f, "seek=%d\nvolstep=%d\nstart=%d\nshuffle=%d\nrepeat=%d\n",
             seek_step, vol_step, start_tab, shuffle, repeat);
+    fprintf(f, "scope=%d\nscmode=%d\nscspan=%d\nscgain=%d\nsctrig=%d\nscstyle=%d\nscfps=%d\nscdelay=%d\n",
+            scope_on, sc_mode, sc_span, sc_gain, sc_trig, sc_blocks, sc_fps, sc_delay);
+    fprintf(f, "sccolx=%s\nsccoly=%s\nscsmooth=%d\nscxyview=%d\n", col[3].code, col[4].code, sc_smooth, sc_xyview);
+    if (music_dir[0]) fprintf(f, "music=%s\nmusicfrom=%s\n", music_dir, music_from);
     fclose(f);
 }
 
 /* change the selected option row by one step (dir = +1 / -1) */
 static void setting_step(int dir) {
-    switch (setsel) {
+    switch (set_row()) {
         case SET_SEEK:    seek_step = cycle_opt(seek_opts, 5, seek_step, dir); break;
         case SET_VOLSTEP: vol_step  = cycle_opt(vol_opts, 4, vol_step, dir); break;
         case SET_START:   start_tab = (start_tab + dir + 4) % 4; break;
+        case SET_EXP_SCOPE: scope_on = !scope_on; settings_rows(); break;   /* shows / hides the tab and its rows */
+        case SET_SC_MODE:  sc_mode  = (sc_mode + dir + 3) % 3; break;
+        case SET_SC_SPAN:  sc_span  = cycle_opt(sc_span_opts, 5, sc_span, dir); break;
+        case SET_SC_GAIN:  sc_gain  = cycle_opt(sc_gain_opts, 5, sc_gain, dir); break;
+        case SET_SC_TRIG:  sc_trig  = !sc_trig; break;
+        case SET_SC_STYLE: sc_blocks = !sc_blocks; break;
+        case SET_SC_FPS:   sc_fps   = cycle_opt(sc_fps_opts, 3, sc_fps, dir); break;
+        case SET_SC_DELAY: sc_delay = cycle_opt(sc_delay_opts, 6, sc_delay, dir); break;
+        case SET_SC_SMOOTH: sc_smooth = (sc_smooth + dir + 4) % 4; break;
+        case SET_SC_XYVIEW: sc_xyview = !sc_xyview; break;
         default: return;
     }
     set_msg = "saved";
@@ -260,8 +378,10 @@ static void setting_step(int dir) {
 }
 
 static void settings_reset(void) {
-    for (int i = 0; i < 3; i++) set_color(&col[i], col[i].def);
+    for (int i = 0; i < 5; i++) set_color(&col[i], col[i].def);
     seek_step = 5; vol_step = 5; start_tab = TAB_TRACKS;
+    sc_mode = 0; sc_span = 50; sc_gain = 0; sc_trig = 1; sc_blocks = 0; sc_fps = 30; sc_delay = 200; sc_smooth = 3; sc_xyview = 1;
+    scope_on = 0; settings_rows();           /* experimental features go back to off */
     set_msg = "all settings reset";
     save_settings();
 }
@@ -271,6 +391,8 @@ static HANDLE child_h = NULL;   /* ffplay process handle, NULL = none */
 static DWORD  child_pid = 0;
 static int paused = 0;
 static int intentional = 0;  /* we killed ffplay, don't auto-advance */
+static int play_gen = 0;     /* bumped on every (re)start: the scope decoder follows it */
+static void scope_stop(void);
 static int volume = 100;
 enum { REP_OFF, REP_ALL, REP_ONE };
 static int repeat = REP_OFF; /* off / repeat-all (loop queue) / repeat-one (track) */
@@ -497,6 +619,56 @@ static void scan_dir(const char *dir, int depth) {
         }
     }
     closedir(d);
+}
+
+/* does this folder hold at least one audio file, as deep as the scan looks? */
+static int dir_has_audio(const char *dir, int depth) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char full[2048];
+        snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
+        DIR *sub = opendir(full);
+        if (sub) {
+            closedir(sub);
+            if (depth > 0) found = dir_has_audio(full, depth - 1);
+        } else if (is_audio(e->d_name)) found = 1;
+    }
+    closedir(d);
+    return found;
+}
+
+/* Settings > Music folder, Enter: check what was typed and, if it is a folder
+ * with music in it, save it and ask the main loop to start over on it.
+ * Nothing is changed (and aqua keeps playing) when the path is no good. */
+static void music_apply(void) {
+    char in[sizeof pbuf];
+    snprintf(in, sizeof in, "%s", pbuf);
+    char *p = in;
+    while (*p == ' ' || *p == '"' || *p == '\'') p++;             /* pasted paths come quoted */
+    size_t L = strlen(p);
+    while (L && (p[L - 1] == ' ' || p[L - 1] == '"' || p[L - 1] == '\'')) p[--L] = '\0';
+    if (L == 0 || strcasecmp(p, "default") == 0) {               /* back to the launch folder */
+        if (!music_dir[0]) { set_msg = "already using the folder aqua was started on"; return; }
+        music_dir[0] = music_from[0] = '\0';
+        save_settings();
+        relaunch = 1;
+        return;
+    }
+    char abs[PATH_MAX];
+    if (!_fullpath(abs, p, PATH_MAX)) { set_msg = "no such folder"; return; }
+    DIR *d = opendir(abs);
+    if (!d) { set_msg = "that is not a folder"; return; }
+    closedir(d);
+    if (!dir_has_audio(abs, 6)) { set_msg = "no audio files in that folder"; return; }
+    if (strcmp(abs, lib_dir) == 0 && strcmp(abs, music_dir) == 0) { set_msg = "already playing that folder"; return; }
+    snprintf(music_dir, sizeof music_dir, "%s", abs);
+    snprintf(music_from, sizeof music_from, "%s", launch_arg);
+    save_settings();
+    relaunch = 1;
 }
 
 static int cmp_track(const void *a, const void *b) {
@@ -1021,6 +1193,7 @@ static void play_track(int idx, double startpos) {
     if (idx < 0 || idx >= ntracks) return;
     stop_child();
     cur = idx;
+    play_gen++;
     base_elapsed = startpos > 0 ? startpos : 0;
     t_start_sec = now_sec();
     paused = 0;
@@ -1212,12 +1385,29 @@ static void clear_query(void) { qlen = 0; query[0] = '\0'; }
 
 /* switch to a tab, resetting drill-down and any active search */
 static void switch_tab(int t) {
+    if (t != TAB_SCOPE) scope_stop();        /* the decoder only runs while it's watched */
     tab = t; in_album = 0;
     free(cur_album); cur_album = NULL;
     searching = 0; clear_query();
     if (tab == TAB_TRACKS) rebuild_view();
-    else if (tab == TAB_SETTINGS) { setsel = 0; editing = 0; set_msg = ""; }
+    else if (tab == TAB_SETTINGS) { setsel = 0; editing = 0; set_msg = ""; settings_rows(); }
+    else if (tab == TAB_SCOPE) { /* nothing to build: scope_pump() starts the decoder */ }
     else { build_albums(); rebuild_albums_view(); alsel = 0; }
+}
+
+/* Tab / Shift-Tab and the number keys walk only the tabs that are showing:
+ * the Scope tab exists only while the experimental oscilloscope is on */
+static int tab_step(int dir) {
+    int t = tab;
+    do t = (t + dir + TAB_COUNT) % TAB_COUNT; while (t == TAB_SCOPE && !scope_on);
+    return t;
+}
+
+static void tab_jump(int n) {            /* n = 0 for the first tab shown */
+    for (int t = 0; t < TAB_COUNT; t++) {
+        if (t == TAB_SCOPE && !scope_on) continue;
+        if (n-- == 0) { switch_tab(t); return; }
+    }
 }
 
 /* open an album from the album list (ai indexes albums[]) */
@@ -1307,6 +1497,305 @@ static int scroll_top = 0;
 static int page_size = 10;      /* visible rows; draw() keeps it current */
 #define MAX_LIST_ROWS 400       /* cap so one frame always fits in out[] */
 
+/* ---- oscilloscope ----
+ * ffplay keeps the audio to itself, so while the Scope tab is open a second,
+ * silent ffmpeg decodes the same track to raw PCM on a pipe. It decodes far
+ * faster than real time and simply blocks on the full pipe; scope_pump()
+ * reads exactly as many samples as the playback clock has advanced, so the
+ * picture follows the music through pause, seek and track changes. Leaving
+ * the tab stops the decoder: the scope costs nothing when it isn't watched. */
+#define SC_RATE 44100                   /* full rate: X-Y curves need every sample */
+#define SC_RING 32768                   /* frames kept (~0.74 s), power of two */
+#define SC_MAXC 200                     /* draw() never goes wider */
+#define SC_XY_MAX 9000                  /* longest X-Y stretch, frames (200 ms) */
+static short sc_l[SC_RING], sc_r[SC_RING];
+static unsigned sc_w = 0;               /* frames written so far */
+static long long sc_read = 0;           /* frames consumed from the decoder */
+static double sc_base = 0;              /* track position of the decoder's first frame */
+static int sc_gen = -1;                 /* play_gen the decoder was started for */
+static int sc_failed = 0;               /* ffmpeg could not be started */
+static unsigned char sc_cells[SC_MAXC * MAX_LIST_ROWS];   /* dot bits per character cell */
+static unsigned char sc_ccol[SC_MAXC * MAX_LIST_ROWS];    /* which colour the cell is drawn in: 0 = X, 1 = Y */
+
+/* SGR sequence for scope colour 0 (X) or 1 (Y); unset follows the accent.
+ * The trailing ";22" keeps apply_theme() from mistaking an explicit 44 or
+ * 252 for the default accent/text colour and re-theming it. */
+static const char *sc_color_seq(int k) {
+    static char seq[2][40];
+    k = k ? 1 : 0;
+    const Color *c = &col[3 + k];
+    if (!c->sgr[0]) return AQUA;
+    snprintf(seq[k], sizeof seq[k], "\033[%s;22m", c->sgr);
+    return seq[k];
+}
+static int sc_pw, sc_ph, sc_cw;         /* canvas in dots, cells per row */
+
+static void sc_push(const short *s, int frames) {
+    for (int i = 0; i < frames; i++) {
+        sc_l[sc_w & (SC_RING - 1)] = s[2 * i];
+        sc_r[sc_w & (SC_RING - 1)] = s[2 * i + 1];
+        sc_w++;
+    }
+}
+
+/* ch: 0 = mono mix, 1 = left, 2 = right */
+static int sc_at(unsigned i, int ch) {
+    i &= SC_RING - 1;
+    return ch == 1 ? sc_l[i] : ch == 2 ? sc_r[i] : (sc_l[i] + sc_r[i]) / 2;
+}
+
+/* light one dot; returns the index of the cell it lives in, or -1 if off-canvas */
+static int sc_plot(int x, int y) {
+    if (x < 0 || y < 0 || x >= sc_pw || y >= sc_ph) return -1;
+    int cell;
+    if (sc_blocks) {
+        cell = (y >> 1) * sc_cw + x;
+        sc_cells[cell] |= (y & 1) ? 2 : 1;
+    } else {
+        static const unsigned char bit[4][2] = { {0x01, 0x08}, {0x02, 0x10}, {0x04, 0x20}, {0x40, 0x80} };
+        cell = (y >> 2) * sc_cw + (x >> 1);
+        sc_cells[cell] |= bit[y & 3][x & 1];
+    }
+    return cell;
+}
+
+/* one trace across the full width, inside the band [ytop, ytop + yh) */
+static void sc_trace(unsigned start, int n, int ch, int ytop, int yh, float gain, int color) {
+    float half = (yh - 1) / 2.0f, mid = ytop + half;
+    int pt = 0, pb = 0;
+    for (int x = 0; x < sc_pw; x++) {
+        int a = (int)((long long)x * n / sc_pw), b = (int)((long long)(x + 1) * n / sc_pw);
+        if (b <= a) b = a + 1;
+        int mn = 32767, mx = -32768;
+        for (int i = a; i < b; i++) {
+            int v = sc_at(start + (unsigned)i, ch);
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        int t  = (int)(mid - mx / 32768.0f * gain * half + 0.5f);
+        int bt = (int)(mid - mn / 32768.0f * gain * half + 0.5f);
+        if (t < ytop) t = ytop;
+        if (t > ytop + yh - 1) t = ytop + yh - 1;
+        if (bt < ytop) bt = ytop;
+        if (bt > ytop + yh - 1) bt = ytop + yh - 1;
+        if (x) {                         /* join up with the previous column */
+            if (t > pb + 1) t = pb + 1;
+            if (bt < pt - 1) bt = pt - 1;
+        }
+        for (int y = t; y <= bt; y++) {
+            int cell = sc_plot(x, y);
+            if (cell >= 0) sc_ccol[cell] = (unsigned char)color;
+        }
+        pt = t; pb = bt;
+    }
+}
+
+/* rasterise the newest samples into sc_cells[] for a cols x h character area */
+static void scope_render(int cols, int h) {
+    if (cols > SC_MAXC) cols = SC_MAXC;
+    if (h > MAX_LIST_ROWS) h = MAX_LIST_ROWS;
+    sc_cw = cols;
+    sc_pw = sc_blocks ? cols : cols * 2;
+    sc_ph = sc_blocks ? h * 2 : h * 4;
+    memset(sc_cells, 0, (size_t)cols * h);
+    memset(sc_ccol, 0, (size_t)cols * h);
+
+    int n = sc_span * SC_RATE / 1000;
+    int have = sc_w > SC_RING ? SC_RING : (int)sc_w;
+    if (have < n + 2) return;            /* decoder still catching up */
+    unsigned start = sc_w - (unsigned)n;
+
+    if (sc_trig && sc_mode != 2) {       /* newest rising zero crossing */
+        int lim = have - n - 2;
+        if (lim > 2048) lim = 2048;
+        for (int k = 0; k < lim; k++) {
+            unsigned i = start - (unsigned)k;
+            if (sc_at(i - 1, 0) < 0 && sc_at(i, 0) >= 0) { start = i; break; }
+        }
+    }
+
+    static float agc = 1.0f;
+    static unsigned gain_w = 0;              /* sc_w the followers last saw */
+    int moved = (sc_w != gain_w);            /* paused: no new samples, hold every scale */
+    gain_w = sc_w;
+    float gain = (float)sc_gain;
+    if (!sc_gain && moved) {
+        /* auto: scale to the loudest sample of everything still in the ring
+         * (~0.7 s), not just the slice on screen, and ease upward slowly - the
+         * picture keeps its proportions instead of breathing with every beat */
+        int peak = 0;
+        for (int i = 0; i < have; i++) {
+            int a = abs(sc_l[i]), b = abs(sc_r[i]);
+            if (a > peak) peak = a;
+            if (b > peak) peak = b;
+        }
+        if (peak > 150) {
+            float want = 0.9f * 32768.0f / peak;
+            if (want > 16.0f) want = 16.0f;
+            if (want < agc) agc = want; else agc += (want - agc) * 0.02f;
+        }
+    }
+    if (!sc_gain) gain = agc;
+
+    if (sc_mode == 0) sc_trace(start, n, 0, 0, sc_ph, gain, 0);
+    else if (sc_mode == 1) {
+        int h2 = sc_ph / 2;
+        sc_trace(start, n, 1, 0, h2, gain, 0);
+        sc_trace(start, n, 2, h2, sc_ph - h2, gain, 1);
+    } else {
+        /* X-Y. Stateless: every frame redraws the last stretch of signal as
+         * one smooth curve - a Catmull-Rom spline through the samples, stepped
+         * a dot at a time - with the newest part in the X colour and the older
+         * tail in the Y colour. The stretch is never shorter than two frames,
+         * so successive pictures overlap and the figure glides instead of
+         * jumping; nothing is accumulated, and a paused track holds still.
+         *
+         * Raw music scribbles so densely that on/off dots turn it into a
+         * filled blob, so (unless smoothing is off) both channels first go
+         * through a two-pole low-pass: what is left is the slow, large motion
+         * - open loops that turn with the bass. Each axis follows its own
+         * slowly-falling peak, so the figure doesn't pump with the beat. */
+        static float fx[SC_XY_MAX + 4], fy[SC_XY_MAX + 4];
+        static float envx = 0, envy = 0;         /* peak followers of what is drawn */
+        static const float coef[4] = { 1.0f, 0.2480f, 0.0949f, 0.0418f };  /* 1 - exp(-2*pi*fc/SC_RATE) */
+        int m = n, two = 2 * SC_RATE / sc_fps;
+        if (m < two) m = two;
+        if (m > SC_XY_MAX) m = SC_XY_MAX;
+        if (m > have - 3) m = have - 3;
+        int warm = have - m - 3;                 /* let the filter settle before the part we draw */
+        if (warm > 4096) warm = 4096;
+        unsigned s0 = sc_w - (unsigned)m - 1;    /* fx[0] is the sample before the stretch */
+        float a = coef[sc_smooth & 3], l1 = 0, l2 = 0, r1 = 0, r2 = 0, pkx = 0, pky = 0;
+        for (int i = -warm; i <= m; i++) {
+            unsigned j = (s0 + (unsigned)i) & (SC_RING - 1);
+            if (i == -warm) { l1 = l2 = sc_l[j]; r1 = r2 = sc_r[j]; }
+            l1 += (sc_l[j] - l1) * a; l2 += (l1 - l2) * a;
+            r1 += (sc_r[j] - r1) * a; r2 += (r1 - r2) * a;
+            if (i >= 0) {
+                float vx = sc_xyview ? (l2 - r2) * 0.5f : l2;    /* wide: side across */
+                float vy = sc_xyview ? (l2 + r2) * 0.5f : r2;    /*       mid up      */
+                fx[i] = vx; fy[i] = vy;
+                if (vx < 0) vx = -vx;
+                if (vy < 0) vy = -vy;
+                if (vx > pkx) pkx = vx;
+                if (vy > pky) pky = vy;
+            }
+        }
+        float gx = gain, gy = gain;
+        if (!sc_gain) {
+            if (moved) {
+                if (!sc_xyview) { if (pky > pkx) pkx = pky; else pky = pkx; }   /* L/R: one scale, true shape */
+                if (pkx > envx) envx = pkx; else envx -= (envx - pkx) * 0.01f;
+                if (pky > envy) envy = pky; else envy -= (envy - pky) * 0.01f;
+            }
+            /* wide may overshoot the edge on the loudest peaks: a bigger
+             * figure the rest of the time is worth a clipped tip now and then */
+            float fill = sc_xyview ? 1.25f : 0.92f;
+            gy = envy > 100.0f ? fill * 32768.0f / envy : 1.0f;
+            gx = envx > 100.0f ? fill * 32768.0f / envx : gy;
+            if (gy > 40.0f) gy = 40.0f;
+            if (gx > gy * 12.0f) gx = gy * 12.0f;    /* a mono track stays a line, not amplified noise */
+        }
+        /* L/R keeps a square plot (true shape); wide has independent axes
+         * anyway, so it takes the whole width */
+        int side = sc_pw < sc_ph ? sc_pw : sc_ph;
+        float rx = ((sc_xyview ? sc_pw : side) - 1) / 2.0f / 32768.0f * gx;
+        float ry = ((sc_xyview ? sc_ph : side) - 1) / 2.0f / 32768.0f * gy;
+        float cx = (sc_pw - 1) / 2.0f, cy = (sc_ph - 1) / 2.0f;
+        int head = m - m * 2 / 5;                /* the newest 40% is the beam */
+        memset(sc_ccol, 1, (size_t)cols * h);
+        for (int i = 0; i + 3 <= m; i++) {
+            float x0 = fx[i], x1 = fx[i + 1], x2 = fx[i + 2], x3 = fx[i + 3];
+            float y0 = fy[i], y1 = fy[i + 1], y2 = fy[i + 2], y3 = fy[i + 3];
+            float dx = (x2 - x1) * rx, dy = (y2 - y1) * ry;
+            if (dx < 0) dx = -dx;
+            if (dy < 0) dy = -dy;
+            int k = (int)(dx > dy ? dx : dy) + 1;    /* one step per dot travelled */
+            if (k > 24) k = 24;                      /* a fast jump is only dotted in */
+            for (int q = 0; q < k; q++) {
+                float t = (float)q / k, t2 = t * t, t3 = t2 * t;
+                float px = 0.5f * (2 * x1 + (x2 - x0) * t + (2 * x0 - 5 * x1 + 4 * x2 - x3) * t2
+                                   + (3 * x1 - x0 - 3 * x2 + x3) * t3);
+                float py = 0.5f * (2 * y1 + (y2 - y0) * t + (2 * y0 - 5 * y1 + 4 * y2 - y3) * t2
+                                   + (3 * y1 - y0 - 3 * y2 + y3) * t3);
+                int cell = sc_plot((int)(cx + px * rx + 0.5f), (int)(cy - py * ry + 0.5f));
+                if (cell >= 0 && i >= head) sc_ccol[cell] = 0;
+            }
+        }
+    }
+}
+
+/* the decoder process, Windows edition: ffmpeg writing PCM into an anonymous pipe */
+static HANDLE sc_proc = NULL, sc_pipe = NULL;
+
+static void scope_stop(void) {
+    if (sc_proc) {
+        TerminateProcess(sc_proc, 0);
+        WaitForSingleObject(sc_proc, 1000);
+        CloseHandle(sc_proc);
+        sc_proc = NULL;
+    }
+    if (sc_pipe) { CloseHandle(sc_pipe); sc_pipe = NULL; }
+    sc_gen = -1;
+}
+
+static void scope_start(void) {
+    scope_stop();
+    sc_gen = play_gen;
+    sc_read = 0; sc_w = 0;
+    memset(sc_l, 0, sizeof sc_l); memset(sc_r, 0, sizeof sc_r);
+    double pos = elapsed() - sc_delay / 1000.0;
+    if (pos < 0) pos = 0;
+    sc_base = pos;
+
+    SECURITY_ATTRIBUTES sa; sa.nLength = sizeof sa; sa.lpSecurityDescriptor = NULL; sa.bInheritHandle = TRUE;
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) { sc_failed = 1; return; }
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);      /* our end stays ours */
+    HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    if (nul == INVALID_HANDLE_VALUE) nul = NULL;
+
+    char cmd[PATH_MAX + 256];
+    snprintf(cmd, sizeof cmd,
+        "ffmpeg -v quiet -nostdin -ss %.3f -i \"%s\" -vn -f s16le -ac 2 -ar %d -",
+        pos, tracks[cur].path, SC_RATE);
+    STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nul; si.hStdOutput = wr; si.hStdError = nul;
+    PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
+    if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        sc_proc = pi.hProcess;
+        sc_pipe = rd;
+        sc_failed = 0;
+    } else {
+        CloseHandle(rd);
+        sc_failed = 1;
+    }
+    CloseHandle(wr);
+    if (nul) CloseHandle(nul);
+}
+
+/* called every main-loop tick while the Scope tab is showing */
+static void scope_pump(void) {
+    if (cur < 0 || !child_h) { if (sc_proc) scope_stop(); return; }
+    if (sc_gen != play_gen) scope_start();
+    if (!sc_pipe) return;
+    long long target = (long long)((elapsed() - sc_delay / 1000.0 - sc_base) * SC_RATE);
+    static unsigned char buf[16384];
+    for (int budget = 64; sc_read < target && budget > 0; budget--) {
+        DWORD avail = 0, got = 0;
+        if (!PeekNamedPipe(sc_pipe, NULL, 0, NULL, &avail, NULL) || avail < 4) break;
+        long long want = (target - sc_read) * 4;
+        if (want > (long long)sizeof buf) want = sizeof buf;
+        if (want > (long long)avail) want = avail & ~(DWORD)3;
+        if (!ReadFile(sc_pipe, buf, (DWORD)want, &got, NULL) || got < 4) break;
+        sc_push((const short *)(void *)buf, (int)(got / 4));
+        sc_read += got / 4;
+    }
+}
+
 /* ---- flicker-free rendering ----
  * The last painted frame is remembered as one 64-bit hash per screen line
  * (a few KB, not a text copy of the screen): draw() emits only the lines
@@ -1317,13 +1806,13 @@ static int page_size = 10;      /* visible rows; draw() keeps it current */
  * \033[2J (blank, then redraw = a hard flash) happens exactly once, at
  * startup. Output accumulates in a small chunk buffer that is flushed as
  * it fills, so even a full repaint never needs a whole-frame buffer. */
-#define MAX_LINE 1024                       /* one rendered screen line */
+#define MAX_LINE 4096                       /* one rendered screen line (scope rows switch colour per cell) */
 #define MAX_FRAME_LINES (MAX_LIST_ROWS + 8)
 static unsigned long long shadow_hash[MAX_FRAME_LINES];
 static int  shadow_count = 0;               /* rows valid in the shadow */
 
 /* the current delta: bounded chunk buffer + whether anything was written */
-typedef struct { char buf[8192]; int n; int wrote; } Delta;
+typedef struct { char buf[16384]; int n; int wrote; } Delta;
 
 static void delta_flush(Delta *del) {
     if (del->n) { fwrite(del->buf, 1, (size_t)del->n, stdout); fflush(stdout); del->n = 0; }
@@ -1386,8 +1875,9 @@ static void draw(void) {
 
     int album_list = on_album_list();
     int settings = (tab == TAB_SETTINGS);
-    int asel   = settings ? setsel    : album_list ? alsel   : sel;     /* active selection */
-    int acount = settings ? SET_COUNT : album_list ? nalview : nview;   /* active list length */
+    int scope = (tab == TAB_SCOPE);
+    int asel   = settings ? setsel    : scope ? 0 : album_list ? alsel   : sel;   /* active selection */
+    int acount = settings ? nset      : album_list ? nalview : nview;   /* active list length */
 
     /* keep the active selection on screen */
     if (asel < scroll_top) scroll_top = asel;
@@ -1409,20 +1899,37 @@ static void draw(void) {
     const char *t_albums  = (tab == TAB_ALBUMS)  ? INVAQ " Albums "  RESET : DGRAY " Albums "  RESET;
     const char *t_folders = (tab == TAB_FOLDERS) ? INVAQ " Folders " RESET : DGRAY " Folders " RESET;
     const char *t_artists = (tab == TAB_ARTISTS) ? INVAQ " Artists " RESET : DGRAY " Artists " RESET;
+    const char *t_scope   = !scope_on ? ""                              /* experimental, off: no tab */
+                          : scope    ? INVAQ " Scope "   RESET : DGRAY " Scope "   RESET;
     const char *t_settings = settings            ? INVAQ " Settings " RESET : DGRAY " Settings " RESET;
     lo = emit(line, sizeof line, 0,
-        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s%s%s",
-        t_tracks, t_albums, t_folders, t_artists, t_settings);
+        AQUA_B "  \xE2\x99\xAC AQUA  " RESET "%s%s%s%s%s%s",
+        t_tracks, t_albums, t_folders, t_artists, t_scope, t_settings);
     flush_line(&del, row++, line);
 
     /* ---- breadcrumb / search line ---- */
-    if (settings && editing)
+    if (settings && editing == 2) {              /* a long path: keep the end you are typing in view */
+        int room = cols - 20;
+        if (room < 10) room = 10;
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "Music folder: " WHITE "%s" AQUA "\xE2\x96\x88" RESET,
+            plen > room ? pbuf + plen - room : pbuf);
+    }
+    else if (settings && editing)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "%s code: " WHITE "%s" AQUA "\xE2\x96\x88" RESET
-            DGRAY "   #rrggbb, 0-255 or default" RESET, set_names[setsel], ebuf);
+            DGRAY "   #rrggbb, 0-255 or default" RESET, set_names[set_row()], ebuf);
     else if (settings)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "Settings%s" AQUA "%s" RESET, *set_msg ? "   " : "", set_msg);
+    else if (scope) {
+        char gb[16];
+        if (sc_gain) snprintf(gb, sizeof gb, "%dx", sc_gain); else snprintf(gb, sizeof gb, "auto");
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "Oscilloscope   " AQUA "%s" DGRAY "   %d ms   gain %s%s" RESET,
+            sc_mode_names[sc_mode], sc_span, gb,
+            sc_mode == 2 ? (sc_xyview ? "   wide" : "   L/R") : sc_trig ? "   triggered" : "");
+    }
     else if (searching)
         lo = emit(line, sizeof line, 0,
             "  " AQUA "/" WHITE "%s" AQUA "\xE2\x96\x88" RESET
@@ -1446,31 +1953,107 @@ static void draw(void) {
     flush_line(&del, row++, line);
 
     /* ---- list body ---- */
+    int scope_live = scope && cur >= 0 && !sc_failed;
+    if (scope_live) scope_render(cols, list_h);
     for (int i = 0; i < list_h; i++) {
         int r = scroll_top + i;
+        if (scope) {                             /* ---- oscilloscope row ---- */
+            lo = 0;
+            line[0] = '\0';
+            if (!scope_live) {
+                if (i == list_h / 2)
+                    lo = emit(line, sizeof line, 0, "  " DGRAY "%s" RESET,
+                        sc_failed ? "The oscilloscope needs ffmpeg on PATH (it decodes the playing track)."
+                                  : "Nothing playing - press space to start a track.");
+            } else {
+                const unsigned char *cr = sc_cells + (size_t)i * cols;
+                int last = cols - 1;
+                while (last >= 0 && !cr[last]) last--;
+                if (last >= 0) {
+                    const unsigned char *cc = sc_ccol + (size_t)i * cols;
+                    int curc = -1;               /* colour currently switched on */
+                    for (int x = 0; x <= last && lo < (int)sizeof line - 64; x++) {
+                        unsigned char c = cr[x];
+                        if (!c) { line[lo++] = ' '; continue; }
+                        if (cc[x] != curc) {
+                            curc = cc[x];
+                            line[lo] = '\0';
+                            lo = emit(line, sizeof line, lo, "%s", sc_color_seq(curc));
+                        }
+                        if (sc_blocks) {         /* upper half, lower half, full block */
+                            line[lo++] = '\xE2'; line[lo++] = '\x96';
+                            line[lo++] = (char)(c == 1 ? 0x80 : c == 2 ? 0x84 : 0x88);
+                        } else {                 /* U+2800 + dot bits */
+                            line[lo++] = '\xE2';
+                            line[lo++] = (char)(0xA0 | (c >> 6));
+                            line[lo++] = (char)(0x80 | (c & 0x3F));
+                        }
+                    }
+                    line[lo] = '\0';
+                    lo = emit(line, sizeof line, lo, RESET);
+                }
+            }
+            flush_line(&del, row++, line);
+            continue;
+        }
         if (settings) {                          /* ---- settings row ---- */
-            if (r < SET_COUNT) {
+            if (r < nset) {
+                int id = set_vis[r];             /* which setting this line shows */
                 char vbuf[16] = "";
                 const char *val = vbuf;
-                if (r <= SET_TEXT)           val = col[r].code;
-                else if (r == SET_SEEK)      snprintf(vbuf, sizeof vbuf, "%ds", seek_step);
-                else if (r == SET_VOLSTEP)   snprintf(vbuf, sizeof vbuf, "%d%%", vol_step);
-                else if (r == SET_START)     val = tab_name(start_tab);
+                if (row_color(id))            val = row_color(id)->code;
+                else if (id == SET_EXP_SCOPE) val = scope_on ? "on" : "off";
+                else if (id == SET_SEEK)      snprintf(vbuf, sizeof vbuf, "%ds", seek_step);
+                else if (id == SET_VOLSTEP)   snprintf(vbuf, sizeof vbuf, "%d%%", vol_step);
+                else if (id == SET_START)     val = tab_name(start_tab);
+                else if (id == SET_SC_MODE)   val = sc_mode_names[sc_mode];
+                else if (id == SET_SC_SPAN)   snprintf(vbuf, sizeof vbuf, "%dms", sc_span);
+                else if (id == SET_SC_GAIN)   { if (sc_gain) snprintf(vbuf, sizeof vbuf, "%dx", sc_gain); else val = "auto"; }
+                else if (id == SET_SC_TRIG)   val = sc_trig ? "on" : "off";
+                else if (id == SET_SC_STYLE)  val = sc_blocks ? "blocks" : "braille";
+                else if (id == SET_SC_FPS)    snprintf(vbuf, sizeof vbuf, "%dfps", sc_fps);
+                else if (id == SET_SC_DELAY)  snprintf(vbuf, sizeof vbuf, "%dms", sc_delay);
+                else if (id == SET_SC_SMOOTH) val = sc_smooth_names[sc_smooth];
+                else if (id == SET_SC_XYVIEW) val = sc_xyview_names[sc_xyview];
+                if (id == SET_MUSIC) {               /* a path gets the rest of the line */
+                    int room = cols - 19, pl = (int)strlen(lib_dir);
+                    if (room < 8) room = 8;
+                    const char *shown = pl > room ? lib_dir + pl - room : lib_dir;
+                    if (r == setsel)
+                        lo = emit(line, sizeof line, 0,
+                            INVAQ " %-13s %*s " RESET, set_names[id], room, shown);
+                    else
+                        lo = emit(line, sizeof line, 0,
+                            " " WHITE "%-13s" RESET " " GRAY "%*s" RESET, set_names[id], room, shown);
+                    flush_line(&del, row++, line);
+                    continue;
+                }
                 int nw = cols - 13;
                 if (nw < 8) nw = 8;
                 if (r == setsel)
                     lo = emit(line, sizeof line, 0,
-                        INVAQ " %-*.*s %7s " RESET, nw, nw, set_names[r], val);
+                        INVAQ " %-*.*s %7s " RESET, nw, nw, set_names[id], val);
                 else
                     lo = emit(line, sizeof line, 0,
                         " " WHITE "%-*.*s" RESET " %s%7s" RESET,
-                        nw, nw, set_names[r], (r == SET_ACCENT) ? AQUA : GRAY, val);
-            } else if (r == SET_COUNT + 1)
+                        nw, nw, set_names[id], (id == SET_ACCENT) ? AQUA : GRAY, val);
+            } else if (r == nset + 1)
                 lo = emit(line, sizeof line, 0,
                     "  " DGRAY "Color codes: hex #rrggbb, 0-255 (256-color palette), or \"default\"" RESET);
-            else if (r == SET_COUNT + 2)
+            else if (r == nset + 2)
                 lo = emit(line, sizeof line, 0,
                     "  " DGRAY "Shuffle and repeat are remembered between runs" RESET);
+            else if (r == nset + 3 && !scope_on)
+                lo = emit(line, sizeof line, 0,
+                    "  " DGRAY "Experimental features are off by default and may still change; turning one on adds its tab and options" RESET);
+            else if (r == nset + 3)
+                lo = emit(line, sizeof line, 0,
+                    "  " DGRAY "Scope: raise the sync delay if the picture runs ahead of the sound; style \"blocks\" if dots show as boxes" RESET);
+            else if (r == nset + 4 && scope_on)
+                lo = emit(line, sizeof line, 0,
+                    "  " DGRAY "Scope X color: the wave, the left channel, the X-Y beam.  Y color: the right channel, the X-Y tail.  default = accent" RESET);
+            else if (r == nset + 5 && *startup_note)
+                lo = emit(line, sizeof line, 0, "  " GRAY "%s" RESET, startup_note);
             else {
                 lo = 0;
                 line[0] = '\0';
@@ -1588,7 +2171,11 @@ static void draw(void) {
     }
 
     /* help line */
-    if (settings && editing)
+    if (settings && editing == 2)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "type or paste a folder path   " DGRAY "\xE2\x86\xB5" GRAY " use it (aqua restarts on it)  "
+            DGRAY "esc" GRAY " cancel  " DGRAY "empty" GRAY " = the folder aqua was started on" RESET);
+    else if (settings && editing)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "type a color code   " DGRAY "\xE2\x86\xB5" GRAY " apply  "
             DGRAY "esc" GRAY " cancel" RESET);
@@ -1597,6 +2184,12 @@ static void draw(void) {
             "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " change  "
             DGRAY "\xE2\x86\x90\xE2\x86\x92" GRAY " adjust  "
             DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "q" GRAY " quit" RESET);
+    else if (scope)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "m" GRAY " mode  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " time span  "
+            DGRAY "space" GRAY " play  " DGRAY "n/b" GRAY " next/prev  "
+            DGRAY "\xE2\x86\x90\xE2\x86\x92" GRAY " seek  " DGRAY "-/+" GRAY " vol %d%%  "
+            DGRAY "\xE2\x87\xA5" GRAY " tabs  " DGRAY "q" GRAY " quit" RESET, volume);
     else if (searching)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "type to filter   " DGRAY "\xE2\x86\xB5" GRAY " keep  "
@@ -1673,17 +2266,28 @@ static BOOL WINAPI on_console_ctrl(DWORD ev) {
 }
 
 int main(int argc, char **argv) {
-    const char *dir = (argc > 1) ? argv[1] : ".";
+    init_cache_path();
+    load_settings();                     /* first: it may name the music folder */
+    settings_rows();
 
-    scan_dir(dir, 6);
+    /* The folder to play: the one aqua was started on, unless Settings >
+     * Music folder has replaced it (see "music folder" above). If the saved
+     * folder has gone missing or empty, fall back rather than refuse to start. */
+    if (argc > 1) snprintf(launch_arg, sizeof launch_arg, "%s", argv[1]);
+    const char *dir = launch_arg[0] ? launch_arg : ".";
+    if (music_dir[0] && (!launch_arg[0] || strcmp(launch_arg, music_from) == 0)) {
+        scan_dir(music_dir, 6);
+        if (ntracks > 0) dir = music_dir;
+        else startup_note = "Note: the saved music folder is missing or empty, so aqua is playing the folder it was started on";
+    }
+    if (ntracks == 0) scan_dir(dir, 6);
     if (ntracks == 0) {
         fprintf(stderr, "No audio files found in '%s'.\n", dir);
         return 1;
     }
+    if (!_fullpath(lib_dir, dir, PATH_MAX)) snprintf(lib_dir, sizeof lib_dir, "%s", dir);
     qsort(tracks, ntracks, sizeof(Track), cmp_track);
 
-    init_cache_path();
-    load_settings();
     load_cache();
 
     /* canonical paths + mtimes, then prefill durations from cache.
@@ -1777,15 +2381,36 @@ int main(int argc, char **argv) {
         }
 
         sync_volume();   /* no-op unless a volume change is still waiting on the stream */
+        int scoping = (tab == TAB_SCOPE);
+        if (scoping) scope_pump();
 
         int probing = probe_idx < ntracks;
 
         if (_kbhit()) {
             int k = read_key();
             int alist = on_album_list();
-            if (tab == TAB_SETTINGS && editing) {
+            if (tab == TAB_SETTINGS && editing == 2) {
+                /* ---- typing a music folder ---- */
+                switch (k) {
+                    case '\r': case '\n':
+                        editing = 0;
+                        music_apply();
+                        if (relaunch) running = 0;       /* saved: start over on it */
+                        break;
+                    case 27: editing = 0; break;                     /* esc: cancel */
+                    case 127: case 8:                                /* backspace */
+                        if (plen > 0) pbuf[--plen] = '\0';
+                        break;
+                    case 3: running = 0; break;
+                    default:
+                        if (k >= 32 && k < 256 && k != 127 && plen < (int)sizeof(pbuf) - 1) {
+                            pbuf[plen++] = (char)k; pbuf[plen] = '\0';
+                        }
+                        break;
+                }
+            } else if (tab == TAB_SETTINGS && editing) {
                 /* ---- typing a colour code (valid codes preview live) ---- */
-                Color *ec = &col[setsel];
+                Color *ec = row_color(set_row());
                 switch (k) {
                     case '\r': case '\n':
                         editing = 0;
@@ -1815,14 +2440,18 @@ int main(int argc, char **argv) {
                 /* ---- settings list ---- */
                 switch (k) {
                     case KEY_UP: case 'k': if (setsel > 0) setsel--; break;
-                    case KEY_DOWN: case 'j': if (setsel < SET_COUNT - 1) setsel++; break;
+                    case KEY_DOWN: case 'j': if (setsel < nset - 1) setsel++; break;
                     case KEY_HOME: case 'g': setsel = 0; break;
-                    case KEY_END: case 'G': setsel = SET_COUNT - 1; break;
+                    case KEY_END: case 'G': setsel = nset - 1; break;
                     case '\r': case '\n': case KEY_RIGHT:
-                        if (setsel <= SET_TEXT) {
+                        if (set_row() == SET_MUSIC) {    /* edit the path, starting from the current one */
+                            editing = 2; set_msg = "";
+                            snprintf(pbuf, sizeof pbuf, "%.*s", (int)sizeof pbuf - 1, lib_dir);
+                            plen = (int)strlen(pbuf);
+                        } else if (row_color(set_row())) {
                             editing = 1; elen = 0; ebuf[0] = '\0'; set_msg = "";
-                            snprintf(eprev, sizeof eprev, "%s", col[setsel].code);
-                        } else if (setsel == SET_RESET) {
+                            snprintf(eprev, sizeof eprev, "%s", row_color(set_row())->code);
+                        } else if (set_row() == SET_RESET) {
                             if (k != KEY_RIGHT) settings_reset();
                         } else setting_step(1);
                         break;
@@ -1832,10 +2461,34 @@ int main(int argc, char **argv) {
                     case 'b': prev_track(); break;
                     case '-': case '_': set_volume(-vol_step); break;
                     case '+': case '=': set_volume(vol_step); break;
-                    case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
-                    case KEY_BTAB: switch_tab((tab + TAB_COUNT - 1) % TAB_COUNT); break;
-                    case '1': case '2': case '3': case '4': case '5':
-                        switch_tab(k - '1'); break;       /* jump straight to a tab */
+                    case '\t': switch_tab(tab_step(1)); break;
+                    case KEY_BTAB: switch_tab(tab_step(-1)); break;
+                    case '1': case '2': case '3': case '4': case '5': case '6':
+                        tab_jump(k - '1'); break;         /* jump straight to a tab */
+                    case 'q': case 3: running = 0; break;
+                }
+            } else if (tab == TAB_SCOPE) {
+                /* ---- oscilloscope ---- */
+                switch (k) {
+                    case 'm': sc_mode = (sc_mode + 1) % 3; save_settings(); break;
+                    case KEY_UP: case 'k':   sc_span = cycle_opt(sc_span_opts, 5, sc_span, 1);  save_settings(); break;
+                    case KEY_DOWN: case 'j': sc_span = cycle_opt(sc_span_opts, 5, sc_span, -1); save_settings(); break;
+                    case ' ': case 'p':
+                        if (cur < 0) { if (nview > 0) play_track(view[sel], 0); }
+                        else toggle_pause();
+                        break;
+                    case 'n': next_track(); break;
+                    case 'b': prev_track(); break;
+                    case KEY_RIGHT: seek(seek_step); break;
+                    case KEY_LEFT: seek(-seek_step); break;
+                    case '-': case '_': set_volume(-vol_step); break;
+                    case '+': case '=': set_volume(vol_step); break;
+                    case 'r': repeat = (repeat + 1) % 3; save_settings(); break;
+                    case 's': shuffle = !shuffle; build_queue(); save_settings(); break;
+                    case '\t': switch_tab(tab_step(1)); break;
+                    case KEY_BTAB: switch_tab(tab_step(-1)); break;
+                    case '1': case '2': case '3': case '4': case '5': case '6':
+                        tab_jump(k - '1'); break;         /* jump straight to a tab */
                     case 'q': case 3: running = 0; break;
                 }
             } else if (searching) {
@@ -1901,10 +2554,10 @@ int main(int argc, char **argv) {
                     case KEY_PGDN:
                         alsel = alsel + page_size < nalview
                               ? alsel + page_size : (nalview ? nalview - 1 : 0); break;
-                    case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
-                    case KEY_BTAB: switch_tab((tab + TAB_COUNT - 1) % TAB_COUNT); break;
-                    case '1': case '2': case '3': case '4': case '5':
-                        switch_tab(k - '1'); break;       /* jump straight to a tab */
+                    case '\t': switch_tab(tab_step(1)); break;
+                    case KEY_BTAB: switch_tab(tab_step(-1)); break;
+                    case '1': case '2': case '3': case '4': case '5': case '6':
+                        tab_jump(k - '1'); break;         /* jump straight to a tab */
                     case '/': searching = 1; break;
                     case 27: if (query[0]) { clear_query(); rebuild_albums_view(); } break;
                     case 'q': case 3: running = 0; break;   /* Ctrl-C = byte 3 here */
@@ -1927,10 +2580,10 @@ int main(int argc, char **argv) {
                     case '+': case '=': set_volume(vol_step); break;
                     case 'r': repeat = (repeat + 1) % 3; save_settings(); break;
                     case 's': shuffle = !shuffle; build_queue(); save_settings(); break;
-                    case '\t': switch_tab((tab + 1) % TAB_COUNT); break;
-                    case KEY_BTAB: switch_tab((tab + TAB_COUNT - 1) % TAB_COUNT); break;
-                    case '1': case '2': case '3': case '4': case '5':
-                        switch_tab(k - '1'); break;       /* jump straight to a tab */
+                    case '\t': switch_tab(tab_step(1)); break;
+                    case KEY_BTAB: switch_tab(tab_step(-1)); break;
+                    case '1': case '2': case '3': case '4': case '5': case '6':
+                        tab_jump(k - '1'); break;         /* jump straight to a tab */
                     case '/': searching = 1; break;
                     case 27:                      /* esc: clear filter, else leave album */
                         if (query[0]) { clear_query(); rebuild_view(); }
@@ -1976,19 +2629,51 @@ int main(int argc, char **argv) {
             }
             if (probe_idx >= ntracks && probed_new) { save_cache(); probed_new = 0; }
         } else {
-            Sleep(25);   /* idle: don't spin; keys are still polled each tick */
+            /* idle: don't spin; keys are still polled each tick */
+            Sleep(scoping && cur >= 0 && !paused ? 4 : 25);
         }
 
-        /* throttle redraws to ~10/sec so probing/progress stay smooth */
+        /* throttle redraws to ~10/sec so probing/progress stay smooth; the
+         * oscilloscope runs at its own frame rate while a track is moving */
         double t = now_sec();
-        if (t - last_draw >= 0.1) { draw(); last_draw = t; }
+        double every = (scoping && cur >= 0 && !paused) ? 1.0 / sc_fps : 0.1;
+        if (t - last_draw >= every) { draw(); last_draw = t; }
     }
 
     stop_child();
+    scope_stop();
     save_cache();          /* persist anything probed this session */
     free_arena();          /* track strings: one bulk release, no per-string frees */
     free_intern();
     if (tracks) { VirtualFree(tracks, 0, MEM_RELEASE); tracks = NULL; }
     term_restore();
+    if (relaunch) {
+        /* Settings > Music folder: start over on the new folder. Everything
+         * above has been saved and released, so this is a clean second run.
+         * Windows has no exec: run a fresh copy in this same console, wait
+         * for it, and pass its exit code on. It is started exactly as this
+         * run was; the saved folder takes over from there. */
+        char exe[PATH_MAX], cmd[PATH_MAX * 2 + 16];
+        if (GetModuleFileNameA(NULL, exe, sizeof exe)) {
+            size_t al = strlen(launch_arg);
+            if (al)     /* a trailing backslash would otherwise escape the closing quote */
+                snprintf(cmd, sizeof cmd, "\"%s\" \"%s%s\"", exe, launch_arg,
+                         launch_arg[al - 1] == '\\' ? "\\" : "");
+            else
+                snprintf(cmd, sizeof cmd, "\"%s\"", exe);
+            STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+            PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
+            if (CreateProcessA(exe, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                DWORD code = 0;
+                GetExitCodeProcess(pi.hProcess, &code);
+                CloseHandle(pi.hProcess);
+                return (int)code;
+            }
+        }
+        fprintf(stderr, "aqua: the music folder is saved, but aqua could not restart itself - start it again.\n");
+        return 1;
+    }
     return 0;
 }
