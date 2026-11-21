@@ -52,6 +52,13 @@
 #define RESET  "\033[0m"
 #define INVAQ  "\033[7;38;5;44m"   /* reverse aqua = selected row */
 
+/* key codes for keys that don't arrive as a single byte */
+enum {
+    KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT,   /* arrows */
+    KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN,
+    KEY_BTAB                                        /* Shift-Tab */
+};
+
 /* ---- track model ----
  * Fields are chosen for a small footprint in big libraries: `name` and
  * `abspath` are derived on demand (basename of path / canonical path in a
@@ -129,6 +136,7 @@ enum { SET_ACCENT, SET_BG, SET_TEXT,          /* colour rows: index col[] */
        SET_SC_STYLE, SET_SC_FPS, SET_SC_DELAY,
        SET_SC_XYVIEW, SET_SC_SMOOTH,
        SET_SC_COLX, SET_SC_COLY,                             /* colour rows: col[3], col[4] */
+       SET_FADEIN, SET_FADEOUT, SET_KEYBINDS,
        SET_RESET, SET_COUNT };
 static const char *const set_names[SET_COUNT] = {
     "Accent color", "Background color", "Text color",
@@ -138,6 +146,7 @@ static const char *const set_names[SET_COUNT] = {
     "Scope style", "Scope frame rate", "Scope sync delay",
     "Scope X-Y view", "Scope X-Y smoothing",
     "Scope X color (left)", "Scope Y color (right)",
+    "Fade in", "Fade out", "Custom keybinds",
     "Reset all settings"
 };
 typedef struct {
@@ -165,6 +174,88 @@ static int  seek_step = 5;               /* seconds per arrow-key seek */
 static int  vol_step  = 5;               /* percent per volume keypress */
 static int  start_tab = TAB_TRACKS;      /* tab shown at launch */
 static int  setsel = 0;                  /* selection in the Settings tab: an index into set_vis[] */
+
+/* ---- custom keybinds ----
+ * Every action keeps one key. The defaults are the keys aqua has always
+ * used; changing one makes that key the action's shortcut everywhere (the
+ * built-in aliases such as j/k and p keep working as well). The keybind
+ * editor is opened from Settings > Custom keybinds. */
+enum {
+    KB_PLAY, KB_NEXT, KB_PREV, KB_SEEKF, KB_SEEKB,
+    KB_UP, KB_DOWN, KB_SHUFFLE, KB_REPEAT, KB_SEARCH, KB_QUIT,
+    KB_VOLUP, KB_VOLDN, KB_COUNT
+};
+static const char *const kb_names[KB_COUNT] = {
+    "Play / pause", "Next track", "Previous track",
+    "Seek forward", "Seek back", "Move up", "Move down",
+    "Shuffle", "Repeat", "Search", "Quit",
+    "Volume up", "Volume down"
+};
+static const int kb_def[KB_COUNT] = {
+    ' ', 'n', 'b', KEY_RIGHT, KEY_LEFT,
+    KEY_UP, KEY_DOWN, 's', 'r', '/', 'q', '+', '-'
+};
+static int kb_key[KB_COUNT];
+static int kb_open = 0;                  /* 1 = the keybind editor is showing */
+static int kbsel = 0;                    /* selection in the keybind editor */
+static int kb_capture = 0;               /* 1 = waiting for the next key press */
+
+/* ---- fades ----
+ * 0 = off; otherwise the length in seconds. A fade is done by ramping the
+ * Core Audio session volume of ffplay, so it never restarts the stream. */
+static double fade_in  = 0.0;
+static double fade_out = 0.0;
+static double fade_mult = 1.0;           /* current fade level, 0..1 */
+static int    fade_in_active = 0;        /* this track started with a fade-in */
+static double fade_start_pos = 0;        /* track position the fade-in began at */
+
+static void kb_defaults(void) {
+    for (int i = 0; i < KB_COUNT; i++) kb_key[i] = kb_def[i];
+}
+
+/* the key that performs action `i`, as text for the UI */
+static const char *key_name(int k, char *buf, size_t n) {
+    switch (k) {
+        case ' ':            return "Space";
+        case '\t':           return "Tab";
+        case '\r': case '\n':return "Enter";
+        case 27:             return "Esc";
+        case 127: case 8:    return "Backspace";
+        case KEY_UP:         return "Up";
+        case KEY_DOWN:       return "Down";
+        case KEY_LEFT:       return "Left";
+        case KEY_RIGHT:      return "Right";
+        case KEY_HOME:       return "Home";
+        case KEY_END:        return "End";
+        case KEY_PGUP:       return "PgUp";
+        case KEY_PGDN:       return "PgDn";
+        case KEY_BTAB:       return "Shift-Tab";
+        default:
+            if (k >= 32 && k < 127) { snprintf(buf, n, "%c", k); return buf; }
+            snprintf(buf, n, "#%d", k);
+            return buf;
+    }
+}
+
+/* a custom key is translated to the action's built-in key, so every tab's
+ * existing key handling performs the action without knowing about binds */
+static int kb_translate(int k) {
+    for (int i = 0; i < KB_COUNT; i++)
+        if (kb_key[i] != kb_def[i] && k == kb_key[i]) return kb_def[i];
+    return k;
+}
+
+/* assign `k` to the selected action; if another action already uses it,
+ * the two keys swap so no action is left without one */
+static void kb_assign(int k) {
+    for (int i = 0; i < KB_COUNT; i++) {
+        if (i != kbsel && kb_key[i] == k) {
+            kb_key[i] = kb_key[kbsel];
+            break;
+        }
+    }
+    kb_key[kbsel] = k;
+}
 
 /* Experimental features ship switched off. The oscilloscope is one: until it
  * is turned on in Settings there is no Scope tab and its option rows are not
@@ -205,10 +296,12 @@ static int set_row(void) {
     if (!nset) settings_rows();
     return set_vis[setsel < nset ? setsel : nset - 1];
 }
-static int  editing = 0;                 /* 1 while typing a colour code */
+static int  editing = 0;                 /* 1 colour code, 2 music folder, 3 fade seconds */
 static char ebuf[12] = "";               /* the code being typed */
 static int  elen = 0;
 static char eprev[12] = "";              /* colour to restore if editing is cancelled */
+static char fbuf[16] = "";               /* fade seconds being typed */
+static int  flen = 0;
 static const char *set_msg = "";         /* feedback for the last change */
 static int  force_full = 0;              /* colours changed: repaint every line */
 static char settings_file[PATH_MAX];
@@ -263,6 +356,19 @@ static int set_color(Color *c, const char *code) {
 
 static const int seek_opts[] = { 5, 10, 15, 30, 60 };
 static const int vol_opts[]  = { 1, 2, 5, 10 };
+static const double fade_opts[] = { 0, 1, 2, 3, 5, 8, 10, 15, 20, 30 };
+
+/* step a fade length through the presets; a typed value between two presets
+ * moves to the next one in the chosen direction */
+static double cycle_fade(double v, int dir) {
+    int n = (int)(sizeof fade_opts / sizeof fade_opts[0]);
+    int i = 0;
+    while (i < n && fade_opts[i] < v - 1e-9) i++;
+    if (i < n && fade_opts[i] <= v + 1e-9)
+        return fade_opts[(i + dir + n) % n];
+    if (dir > 0) return i < n ? fade_opts[i] : fade_opts[n - 1];
+    return i > 0 ? fade_opts[i - 1] : fade_opts[0];
+}
 
 /* oscilloscope tab (see "oscilloscope" below) */
 static const char *const sc_mode_names[] = { "Wave", "Stereo", "X-Y" };
@@ -337,6 +443,12 @@ static void load_settings(void) {
         else if (!strcmp(ln, "scxyview"))   sc_xyview = (n != 0);
         else if (!strcmp(ln, "shuffle"))    shuffle = (n != 0);
         else if (!strcmp(ln, "repeat"))     { if (n >= 0 && n < 3) repeat = n; }
+        else if (!strcmp(ln, "fadein"))     { fade_in  = atof(v); if (fade_in  < 0) fade_in  = 0; if (fade_in  > 60) fade_in  = 60; }
+        else if (!strcmp(ln, "fadeout"))    { fade_out = atof(v); if (fade_out < 0) fade_out = 0; if (fade_out > 60) fade_out = 60; }
+        else if (!strncmp(ln, "bind_", 5))  {
+            int i = atoi(ln + 5);
+            if (i >= 0 && i < KB_COUNT && n > 0) kb_key[i] = n;
+        }
     }
     fclose(f);
 }
@@ -351,6 +463,8 @@ static void save_settings(void) {
     fprintf(f, "scope=%d\nscmode=%d\nscspan=%d\nscgain=%d\nsctrig=%d\nscstyle=%d\nscfps=%d\nscdelay=%d\n",
             scope_on, sc_mode, sc_span, sc_gain, sc_trig, sc_blocks, sc_fps, sc_delay);
     fprintf(f, "sccolx=%s\nsccoly=%s\nscsmooth=%d\nscxyview=%d\n", col[3].code, col[4].code, sc_smooth, sc_xyview);
+    fprintf(f, "fadein=%.2f\nfadeout=%.2f\n", fade_in, fade_out);
+    for (int i = 0; i < KB_COUNT; i++) fprintf(f, "bind_%d=%d\n", i, kb_key[i]);
     if (music_dir[0]) fprintf(f, "music=%s\nmusicfrom=%s\n", music_dir, music_from);
     fclose(f);
 }
@@ -371,6 +485,8 @@ static void setting_step(int dir) {
         case SET_SC_DELAY: sc_delay = cycle_opt(sc_delay_opts, 6, sc_delay, dir); break;
         case SET_SC_SMOOTH: sc_smooth = (sc_smooth + dir + 4) % 4; break;
         case SET_SC_XYVIEW: sc_xyview = !sc_xyview; break;
+        case SET_FADEIN:   fade_in  = cycle_fade(fade_in,  dir); break;
+        case SET_FADEOUT:  fade_out = cycle_fade(fade_out, dir); break;
         default: return;
     }
     set_msg = "saved";
@@ -381,9 +497,61 @@ static void settings_reset(void) {
     for (int i = 0; i < 5; i++) set_color(&col[i], col[i].def);
     seek_step = 5; vol_step = 5; start_tab = TAB_TRACKS;
     sc_mode = 0; sc_span = 50; sc_gain = 0; sc_trig = 1; sc_blocks = 0; sc_fps = 30; sc_delay = 200; sc_smooth = 3; sc_xyview = 1;
+    fade_in = fade_out = 0; kb_defaults(); kb_open = 0; kb_capture = 0;
     scope_on = 0; settings_rows();           /* experimental features go back to off */
     set_msg = "all settings reset";
     save_settings();
+}
+
+/* ---- child lifetime guard ----
+ * Every child (ffplay, the scope decoder, ffprobe) is put in one job with
+ * KILL_ON_JOB_CLOSE. If aqua dies for any reason - q, the window's X button,
+ * Task Manager, a crash - Windows closes the job and takes the children with
+ * it, so no ffplay is left playing in the background. */
+static HANDLE g_job = NULL;
+
+static void job_init(void) {
+    g_job = CreateJobObjectA(NULL, NULL);
+    if (!g_job) return;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+    memset(&li, 0, sizeof li);
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &li, sizeof li);
+}
+
+static void job_add(HANDLE h) {
+    if (g_job && h) AssignProcessToJobObject(g_job, h);
+}
+
+/* ---- one instance at a time ----
+ * Opening aqua again asks the running copy to quit (it stops ffplay on the
+ * way out) and waits for it, so a second launch doesn't leave the first
+ * one's audio playing underneath it. */
+static HANDLE g_instance = NULL, g_quit_ev = NULL;
+
+static void instance_init(void) {
+    g_instance = CreateMutexA(NULL, TRUE, "Local\\aqua.single");
+    int first = !(g_instance && GetLastError() == ERROR_ALREADY_EXISTS);
+    g_quit_ev = CreateEventA(NULL, TRUE, FALSE, "Local\\aqua.quit");
+    if (first) {
+        if (g_quit_ev) ResetEvent(g_quit_ev);
+    } else {
+        if (g_quit_ev) SetEvent(g_quit_ev);
+        if (g_instance) {
+            DWORD w = WaitForSingleObject(g_instance, 3000);
+            if ((w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) && g_quit_ev)
+                ResetEvent(g_quit_ev);
+        }
+    }
+}
+
+static int instance_quit_requested(void) {
+    return g_quit_ev && WaitForSingleObject(g_quit_ev, 0) == WAIT_OBJECT_0;
+}
+
+static void instance_release(void) {
+    if (g_instance) { ReleaseMutex(g_instance); CloseHandle(g_instance); g_instance = NULL; }
+    if (g_quit_ev)  { CloseHandle(g_quit_ev); g_quit_ev = NULL; }
 }
 
 /* ---- child (ffplay) control, Windows edition ---- */
@@ -777,6 +945,7 @@ static int probe_meta(Track *t) {
         if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
         return 0;                        /* ffprobe missing: retried next run */
     }
+    job_add(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(wr);                     /* our copy: child's stays open */
 
@@ -1164,15 +1333,47 @@ static void sync_volume(void) {
         if (session_volume_op(child_pid, 0, 0, &v)) {
             volume = (int)(v * 100.0f + 0.5f);
             vol_known = volume;
+            if (fade_mult < 1.0)
+                session_volume_op(child_pid, 1, (float)(volume / 100.0 * fade_mult), NULL);
             vol_sync = 0;
             return;
         }
-    } else if (session_volume_op(child_pid, 1, volume / 100.0f, NULL)) {
+    } else if (session_volume_op(child_pid, 1, (float)(volume / 100.0 * fade_mult), NULL)) {
         vol_known = volume;
         vol_sync = 0;
         return;
     }
     if (now_sec() - vol_sync_t0 > 5.0) vol_sync = 0;   /* no audio session: give up */
+}
+
+/* Ramp the live session volume for a fade-in / fade-out. Runs every loop
+ * tick; it only touches the audio session when the level actually changes. */
+static void fade_tick(void) {
+    if (cur < 0 || !child_h) { fade_mult = 1.0; fade_in_active = 0; return; }
+    double el = elapsed();
+    double m = 1.0;
+    if (fade_in_active && fade_in > 0) {
+        double t = el - fade_start_pos;
+        if (t < 0) t = 0;
+        if (t < fade_in) m = t / fade_in;
+        else fade_in_active = 0;
+    }
+    double dur = tracks[cur].dur;
+    if (fade_out > 0 && dur > 0) {
+        double rem = dur - el;
+        if (rem < fade_out) {
+            double f = rem / fade_out;
+            if (f < 0) f = 0;
+            if (f < m) m = f;
+        }
+    }
+    if (m < 0) m = 0;
+    if (m > 1) m = 1;
+    if (m != fade_mult) {
+        fade_mult = m;
+        if (session_volume_op(child_pid, 1, (float)(volume / 100.0 * fade_mult), NULL))
+            vol_known = volume;
+    }
 }
 
 /* ---- child control ---- */
@@ -1187,6 +1388,8 @@ static void stop_child(void) {
         child_pid = 0;
     }
     paused = 0;
+    fade_mult = 1.0;
+    fade_in_active = 0;
 }
 
 static void play_track(int idx, double startpos) {
@@ -1197,6 +1400,9 @@ static void play_track(int idx, double startpos) {
     base_elapsed = startpos > 0 ? startpos : 0;
     t_start_sec = now_sec();
     paused = 0;
+    fade_in_active = (fade_in > 0 && startpos <= 0.0);
+    fade_start_pos = startpos > 0 ? startpos : 0;
+    fade_mult = fade_in_active ? 0.0 : 1.0;
 
     /* Build a single command line for CreateProcess. ffplay is found on PATH.
      * No -volume: the level is applied through the Windows audio session
@@ -1215,6 +1421,7 @@ static void play_track(int idx, double startpos) {
     PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
     if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        job_add(pi.hProcess);
         CloseHandle(pi.hThread);
         child_h = pi.hProcess;
         child_pid = pi.dwProcessId;
@@ -1390,7 +1597,7 @@ static void switch_tab(int t) {
     free(cur_album); cur_album = NULL;
     searching = 0; clear_query();
     if (tab == TAB_TRACKS) rebuild_view();
-    else if (tab == TAB_SETTINGS) { setsel = 0; editing = 0; set_msg = ""; settings_rows(); }
+    else if (tab == TAB_SETTINGS) { setsel = 0; editing = 0; kb_open = 0; kb_capture = 0; set_msg = ""; settings_rows(); }
     else if (tab == TAB_SCOPE) { /* nothing to build: scope_pump() starts the decoder */ }
     else { build_albums(); rebuild_albums_view(); alsel = 0; }
 }
@@ -1765,6 +1972,7 @@ static void scope_start(void) {
     si.hStdInput = nul; si.hStdOutput = wr; si.hStdError = nul;
     PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
     if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        job_add(pi.hProcess);
         CloseHandle(pi.hThread);
         sc_proc = pi.hProcess;
         sc_pipe = rd;
@@ -1875,9 +2083,10 @@ static void draw(void) {
 
     int album_list = on_album_list();
     int settings = (tab == TAB_SETTINGS);
+    int kb = settings && kb_open;
     int scope = (tab == TAB_SCOPE);
-    int asel   = settings ? setsel    : scope ? 0 : album_list ? alsel   : sel;   /* active selection */
-    int acount = settings ? nset      : album_list ? nalview : nview;   /* active list length */
+    int asel   = kb ? kbsel : settings ? setsel : scope ? 0 : album_list ? alsel : sel;   /* active selection */
+    int acount = kb ? KB_COUNT : settings ? nset : album_list ? nalview : nview;   /* active list length */
 
     /* keep the active selection on screen */
     if (asel < scroll_top) scroll_top = asel;
@@ -1908,7 +2117,15 @@ static void draw(void) {
     flush_line(&del, row++, line);
 
     /* ---- breadcrumb / search line ---- */
-    if (settings && editing == 2) {              /* a long path: keep the end you are typing in view */
+    if (settings && kb_open)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "Settings \xE2\x96\xB8 " AQUA "Keybinds" DGRAY "   %s" RESET,
+            kb_capture ? "press a key (esc cancels)" : "Enter: change   Backspace: reset   Esc: back");
+    else if (settings && editing == 3)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "%s seconds: " WHITE "%s" AQUA "\xE2\x96\x88" RESET
+            DGRAY "   0 = off" RESET, set_row() == SET_FADEIN ? "Fade in" : "Fade out", fbuf);
+    else if (settings && editing == 2) {              /* a long path: keep the end you are typing in view */
         int room = cols - 20;
         if (room < 10) room = 10;
         lo = emit(line, sizeof line, 0,
@@ -1997,6 +2214,32 @@ static void draw(void) {
             continue;
         }
         if (settings) {                          /* ---- settings row ---- */
+            if (kb) {                            /* ---- keybind editor row ---- */
+                if (r < KB_COUNT) {
+                    char kn[16];
+                    const char *ks = key_name(kb_key[r], kn, sizeof kn);
+                    int nw = cols - 13;
+                    if (nw < 8) nw = 8;
+                    if (r == kbsel)
+                        lo = emit(line, sizeof line, 0,
+                            INVAQ " %-*.*s %7s " RESET, nw, nw, kb_names[r], ks);
+                    else
+                        lo = emit(line, sizeof line, 0,
+                            " " WHITE "%-*.*s" RESET " %s%7s" RESET,
+                            nw, nw, kb_names[r], GRAY, ks);
+                } else if (r == KB_COUNT + 1)
+                    lo = emit(line, sizeof line, 0,
+                        "  " DGRAY "Enter: press the new key.  Backspace: back to the default.  Esc: Settings" RESET);
+                else if (r == KB_COUNT + 2)
+                    lo = emit(line, sizeof line, 0,
+                        "  " DGRAY "Built-in aliases (j/k, p, =, _, g/G, Home/End, PgUp/PgDn) keep working" RESET);
+                else {
+                    lo = 0;
+                    line[0] = '\0';
+                }
+                flush_line(&del, row++, line);
+                continue;
+            }
             if (r < nset) {
                 int id = set_vis[r];             /* which setting this line shows */
                 char vbuf[16] = "";
@@ -2015,6 +2258,9 @@ static void draw(void) {
                 else if (id == SET_SC_DELAY)  snprintf(vbuf, sizeof vbuf, "%dms", sc_delay);
                 else if (id == SET_SC_SMOOTH) val = sc_smooth_names[sc_smooth];
                 else if (id == SET_SC_XYVIEW) val = sc_xyview_names[sc_xyview];
+                else if (id == SET_FADEIN)    { if (fade_in  > 0) snprintf(vbuf, sizeof vbuf, "%.1fs", fade_in);  else val = "off"; }
+                else if (id == SET_FADEOUT)   { if (fade_out > 0) snprintf(vbuf, sizeof vbuf, "%.1fs", fade_out); else val = "off"; }
+                else if (id == SET_KEYBINDS)  val = "edit";
                 if (id == SET_MUSIC) {               /* a path gets the rest of the line */
                     int room = cols - 19, pl = (int)strlen(lib_dir);
                     if (room < 8) room = 8;
@@ -2171,7 +2417,15 @@ static void draw(void) {
     }
 
     /* help line */
-    if (settings && editing == 2)
+    if (settings && kb_open)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " change key  "
+            DGRAY "Backspace" GRAY " reset  " DGRAY "Esc" GRAY " back" RESET);
+    else if (settings && editing == 3)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "type seconds (0 = off)   " DGRAY "\xE2\x86\xB5" GRAY " apply  "
+            DGRAY "esc" GRAY " cancel" RESET);
+    else if (settings && editing == 2)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "type or paste a folder path   " DGRAY "\xE2\x86\xB5" GRAY " use it (aqua restarts on it)  "
             DGRAY "esc" GRAY " cancel  " DGRAY "empty" GRAY " = the folder aqua was started on" RESET);
@@ -2225,12 +2479,6 @@ static void draw(void) {
 }
 
 /* ---- input ---- */
-enum {
-    KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT,   /* arrows */
-    KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN,
-    KEY_BTAB                                        /* Shift-Tab */
-};
-
 /* Returns an ASCII byte, a KEY_* code, or -1 (no key / ignored key).
  * Windows console "extended" keys (arrows, Home/End/PgUp/PgDn, Delete...)
  * arrive as 0xE0- or 0-prefixed scan codes; the useful ones are mapped and
@@ -2266,6 +2514,9 @@ static BOOL WINAPI on_console_ctrl(DWORD ev) {
 }
 
 int main(int argc, char **argv) {
+    job_init();
+    instance_init();
+    kb_defaults();
     init_cache_path();
     load_settings();                     /* first: it may name the music folder */
     settings_rows();
@@ -2366,7 +2617,7 @@ int main(int argc, char **argv) {
     double last_draw = 0;
 
     int running = 1;
-    while (running && !g_stop) {
+    while (running && !g_stop && !instance_quit_requested()) {
         /* reap a naturally-finished track -> advance */
         if (child_h) {
             if (WaitForSingleObject(child_h, 0) == WAIT_OBJECT_0) {
@@ -2381,6 +2632,7 @@ int main(int argc, char **argv) {
         }
 
         sync_volume();   /* no-op unless a volume change is still waiting on the stream */
+        fade_tick();     /* ramp the session volume during a fade-in / fade-out */
         int scoping = (tab == TAB_SCOPE);
         if (scoping) scope_pump();
 
@@ -2389,6 +2641,44 @@ int main(int argc, char **argv) {
         if (_kbhit()) {
             int k = read_key();
             int alist = on_album_list();
+
+            if (kb_open) {
+                /* ---- keybind editor ---- */
+                if (kb_capture) {
+                    if (k == 27) { kb_capture = 0; set_msg = "cancelled"; }
+                    else if (k == 3) { kb_capture = 0; }
+                    else if (k > 0) {
+                        kb_assign(k);
+                        kb_capture = 0;
+                        save_settings();
+                        set_msg = "key updated";
+                    }
+                } else {
+                    switch (k) {
+                        case KEY_UP: case 'k': if (kbsel > 0) kbsel--; break;
+                        case KEY_DOWN: case 'j': if (kbsel < KB_COUNT - 1) kbsel++; break;
+                        case KEY_HOME: case 'g': kbsel = 0; break;
+                        case KEY_END: case 'G': kbsel = KB_COUNT - 1; break;
+                        case '\r': case '\n': kb_capture = 1; set_msg = ""; break;
+                        case 127: case 8:
+                            kb_key[kbsel] = kb_def[kbsel];
+                            save_settings();
+                            set_msg = "default restored";
+                            break;
+                        case 27: case 'q': kb_open = 0; set_msg = ""; break;
+                        case 3: running = 0; break;
+                    }
+                }
+                draw();
+                last_draw = now_sec();
+                continue;
+            }
+
+            /* a custom key stands in for the action's built-in key; never
+             * while the user is typing text */
+            if (!searching && !(tab == TAB_SETTINGS && editing) && k > 0)
+                k = kb_translate(k);
+
             if (tab == TAB_SETTINGS && editing == 2) {
                 /* ---- typing a music folder ---- */
                 switch (k) {
@@ -2405,6 +2695,33 @@ int main(int argc, char **argv) {
                     default:
                         if (k >= 32 && k < 256 && k != 127 && plen < (int)sizeof(pbuf) - 1) {
                             pbuf[plen++] = (char)k; pbuf[plen] = '\0';
+                        }
+                        break;
+                }
+            } else if (tab == TAB_SETTINGS && editing == 3) {
+                /* ---- typing a fade length in seconds ---- */
+                switch (k) {
+                    case '\r': case '\n': {
+                        editing = 0;
+                        double v = atof(fbuf);
+                        if (v < 0) v = 0;
+                        if (v > 60) v = 60;
+                        if (set_row() == SET_FADEIN) fade_in = v;
+                        else                         fade_out = v;
+                        save_settings();
+                        set_msg = v > 0 ? "fade saved" : "fade off";
+                        break;
+                    }
+                    case 27: editing = 0; break;                     /* esc: cancel */
+                    case 127: case 8:
+                        if (flen > 0) fbuf[--flen] = '\0';
+                        break;
+                    case 3: running = 0; break;
+                    default:
+                        if (((k >= '0' && k <= '9') || k == '.') &&
+                            flen < (int)sizeof(fbuf) - 1) {
+                            fbuf[flen++] = (char)k;
+                            fbuf[flen] = '\0';
                         }
                         break;
                 }
@@ -2451,6 +2768,16 @@ int main(int argc, char **argv) {
                         } else if (row_color(set_row())) {
                             editing = 1; elen = 0; ebuf[0] = '\0'; set_msg = "";
                             snprintf(eprev, sizeof eprev, "%s", row_color(set_row())->code);
+                        } else if (set_row() == SET_KEYBINDS) {
+                            kb_open = 1; kbsel = 0; kb_capture = 0; set_msg = "";
+                        } else if (set_row() == SET_FADEIN || set_row() == SET_FADEOUT) {
+                            if (k == KEY_RIGHT) setting_step(1);
+                            else {
+                                double v = set_row() == SET_FADEIN ? fade_in : fade_out;
+                                editing = 3; set_msg = "";
+                                snprintf(fbuf, sizeof fbuf, "%.1f", v);
+                                flen = (int)strlen(fbuf);
+                            }
                         } else if (set_row() == SET_RESET) {
                             if (k != KEY_RIGHT) settings_reset();
                         } else setting_step(1);
@@ -2647,6 +2974,7 @@ int main(int argc, char **argv) {
     free_intern();
     if (tracks) { VirtualFree(tracks, 0, MEM_RELEASE); tracks = NULL; }
     term_restore();
+    instance_release();    /* the relaunch below is a new instance, not a second copy */
     if (relaunch) {
         /* Settings > Music folder: start over on the new folder. Everything
          * above has been saved and released, so this is a clean second run.

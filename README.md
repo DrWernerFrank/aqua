@@ -94,6 +94,12 @@ playback. That level is the one you see for `ffplay.exe` in the Windows Volume
 Mixer; Windows remembers it between tracks and runs, and aqua picks it up at
 startup instead of resetting it to 100%.
 
+Every child process (`ffplay`, the optional scope decoder, `ffprobe`) is
+placed in a Windows job object with `KILL_ON_JOB_CLOSE`, so closing aqua from
+the window's **X**, Task Manager, or a crash takes the audio with it instead
+of leaving an orphaned `ffplay` playing. Opening aqua a second time asks the
+running copy to quit first (and waits for it).
+
 ```powershell
 # Requirements: a MinGW-w64 gcc, plus ffmpeg on PATH (winget install Gyan.FFmpeg)
 gcc -O2 -Wall -o aqua.exe aqua_win.c
@@ -142,6 +148,9 @@ shortcut or shell alias that always passes one folder keeps your choice. A
 | `g` / `G`, `Home` / `End` | jump to top / bottom |
 | `PgUp` / `PgDn`| move a page            |
 | `q` / `Ctrl-C` | quit                    |
+
+On Windows every action in the table can also be reached with a key of your
+choosing: see **Settings → Custom keybinds** below.
 
 ### Tabs
 
@@ -216,6 +225,9 @@ The last tab. `↑↓` pick a row, `Enter` changes it, `←`/`→` step option r
 | **Scope X-Y smoothing** | low-pass before drawing: off / light / medium / heavy |
 | **Scope X color (left)** | color code for the wave, the left channel in Stereo, and the newest part of the X-Y curve; `default` follows the accent |
 | **Scope Y color (right)** | color code for the right channel in Stereo and the X-Y tail; `default` follows the accent |
+| **Fade in** | `off`, or a length in seconds: the Windows port ramps the track up from silence when it starts. `Enter` types a value (`0` = off), `←`/`→` step through the presets |
+| **Fade out** | `off`, or a length in seconds: the Windows port ramps the track down to silence over its last seconds |
+| **Custom keybinds** | `Enter` opens the keybind editor (Windows port) |
 | **Reset all settings** | back to the defaults above (the music folder is kept) |
 
 Colors are typed as a code:
@@ -229,6 +241,16 @@ The whole UI previews the color as soon as the code is valid; `Enter` keeps it,
 Everything is saved to `~/.config/aqua/settings` on Linux and
 `%LOCALAPPDATA%\aqua\settings` on Windows. Playback keys (`Space`, `n`/`b`,
 `-`/`+`) keep working in this tab.
+
+### Custom keybinds (Windows)
+
+**Settings → Custom keybinds**, then `Enter`. The editor lists every action
+with its key. `↑↓` pick an action, `Enter` then press the key you want,
+`Backspace` restores the default, `Esc` goes back to Settings. Changing an
+action to a key another action uses swaps the two. Everything is saved to
+`%LOCALAPPDATA%\aqua\settings` and applies everywhere: the new key performs
+the action in any tab, and the built-in aliases (`j`/`k`, `p`, `=`, `_`,
+`g`/`G`, `Home`/`End`, `PgUp`/`PgDn`) keep working as well.
 
 ### Search
 
