@@ -1,0 +1,3 @@
+# Keep the source tree LF; this repository is built on Linux and Windows
+# (MinGW accepts LF source too, so no per-file exceptions are needed).
+* text=auto eol=lf

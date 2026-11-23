@@ -46,6 +46,14 @@
 #define RESET  "\033[0m"
 #define INVAQ  "\033[7;38;5;44m"   /* reverse aqua = selected row */
 
+/* ---- keys ---- */
+enum {
+    KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT,   /* arrows (CSI and SS3) */
+    KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN,
+    KEY_BTAB,                                      /* Shift-Tab */
+    KEY_IGNORE = -2                                /* consumed, no action */
+};
+
 /* ---- track model ----
  * Fields are chosen for a small footprint in big libraries: `name` and
  * `abspath` are derived on demand (basename of path / canonical path in a
@@ -140,6 +148,7 @@ enum { SET_ACCENT, SET_BG, SET_TEXT,          /* colour rows: index col[] */
        SET_SC_STYLE, SET_SC_FPS, SET_SC_DELAY,
        SET_SC_XYVIEW, SET_SC_SMOOTH,
        SET_SC_COLX, SET_SC_COLY,                             /* colour rows: col[3], col[4] */
+       SET_FADEIN, SET_FADEOUT, SET_KEYBINDS,
        SET_RESET, SET_COUNT };
 static const char *const set_names[SET_COUNT] = {
     "Accent color", "Background color", "Text color",
@@ -149,6 +158,7 @@ static const char *const set_names[SET_COUNT] = {
     "Scope style", "Scope frame rate", "Scope sync delay",
     "Scope X-Y view", "Scope X-Y smoothing",
     "Scope X color (left)", "Scope Y color (right)",
+    "Fade in", "Fade out", "Custom keybinds",
     "Reset all settings"
 };
 typedef struct {
@@ -176,6 +186,86 @@ static int  seek_step = 5;               /* seconds per arrow-key seek */
 static int  vol_step  = 5;               /* percent per volume keypress */
 static int  start_tab = TAB_TRACKS;      /* tab shown at launch */
 static int  setsel = 0;                  /* selection in the Settings tab: an index into set_vis[] */
+
+/* ---- custom keybinds ----
+ * Every action keeps one key. The defaults are the keys aqua has always
+ * used; changing one makes that key the action's shortcut everywhere (the
+ * built-in aliases such as j/k and p keep working as well). The keybind
+ * editor is opened from Settings > Custom keybinds. */
+enum {
+    KB_PLAY, KB_NEXT, KB_PREV, KB_SEEKF, KB_SEEKB,
+    KB_UP, KB_DOWN, KB_SHUFFLE, KB_REPEAT, KB_SEARCH, KB_QUIT,
+    KB_VOLUP, KB_VOLDN, KB_COUNT
+};
+static const char *const kb_names[KB_COUNT] = {
+    "Play / pause", "Next track", "Previous track",
+    "Seek forward", "Seek back", "Move up", "Move down",
+    "Shuffle", "Repeat", "Search", "Quit",
+    "Volume up", "Volume down"
+};
+static const int kb_def[KB_COUNT] = {
+    ' ', 'n', 'b', KEY_RIGHT, KEY_LEFT,
+    KEY_UP, KEY_DOWN, 's', 'r', '/', 'q', '+', '-'
+};
+static int kb_key[KB_COUNT];
+static int kb_open = 0;                  /* 1 = the keybind editor is showing */
+static int kbsel = 0;                    /* selection in the keybind editor */
+static int kb_capture = 0;               /* 1 = waiting for the next key press */
+
+/* ---- fades ----
+ * 0 = off; otherwise the length in seconds. ffplay applies the fade in its
+ * own filter chain (see fade_filter), so it never restarts the stream and
+ * never touches another application's volume. */
+static double fade_in  = 0.0;
+static double fade_out = 0.0;
+
+static void kb_defaults(void) {
+    for (int i = 0; i < KB_COUNT; i++) kb_key[i] = kb_def[i];
+}
+
+/* the key that performs action `i`, as text for the UI */
+static const char *key_name(int k, char *buf, size_t n) {
+    switch (k) {
+        case ' ':            return "Space";
+        case '\t':           return "Tab";
+        case '\r': case '\n':return "Enter";
+        case 27:             return "Esc";
+        case 127: case 8:    return "Backspace";
+        case KEY_UP:         return "Up";
+        case KEY_DOWN:       return "Down";
+        case KEY_LEFT:       return "Left";
+        case KEY_RIGHT:      return "Right";
+        case KEY_HOME:       return "Home";
+        case KEY_END:        return "End";
+        case KEY_PGUP:       return "PgUp";
+        case KEY_PGDN:       return "PgDn";
+        case KEY_BTAB:       return "Shift-Tab";
+        default:
+            if (k >= 32 && k < 127) { snprintf(buf, n, "%c", k); return buf; }
+            snprintf(buf, n, "#%d", k);
+            return buf;
+    }
+}
+
+/* a custom key is translated to the action's built-in key, so every tab's
+ * existing key handling performs the action without knowing about binds */
+static int kb_translate(int k) {
+    for (int i = 0; i < KB_COUNT; i++)
+        if (kb_key[i] != kb_def[i] && k == kb_key[i]) return kb_def[i];
+    return k;
+}
+
+/* assign `k` to the selected action; if another action already uses it,
+ * the two keys swap so no action is left without one */
+static void kb_assign(int k) {
+    for (int i = 0; i < KB_COUNT; i++) {
+        if (i != kbsel && kb_key[i] == k) {
+            kb_key[i] = kb_key[kbsel];
+            break;
+        }
+    }
+    kb_key[kbsel] = k;
+}
 
 /* Experimental features ship switched off. The oscilloscope is one: until it
  * is turned on in Settings there is no Scope tab and its option rows are not
@@ -220,6 +310,8 @@ static int  editing = 0;                 /* 1 while typing a colour code */
 static char ebuf[12] = "";               /* the code being typed */
 static int  elen = 0;
 static char eprev[12] = "";              /* colour to restore if editing is cancelled */
+static char fbuf[16] = "";               /* the fade length being typed, in seconds */
+static int  flen = 0;
 static const char *set_msg = "";         /* feedback for the last change */
 static int  force_full = 0;              /* colours changed: repaint every line */
 static char settings_file[PATH_MAX];
@@ -310,6 +402,21 @@ static int cycle_opt(const int *opts, int n, int v, int dir) {
     return opts[(i + dir + n) % n];
 }
 
+/* fade lengths offered by the Settings rows, in seconds (0 = off) */
+static const double fade_opts[] = { 0, 1, 2, 3, 5, 8, 10, 15, 20, 30 };
+
+/* step a fade length through the presets; a typed value between two presets
+ * lands on the next one in the direction of travel */
+static double cycle_fade(double v, int dir) {
+    int n = (int)(sizeof fade_opts / sizeof fade_opts[0]);
+    int i = 0;
+    while (i < n && fade_opts[i] < v - 1e-9) i++;
+    if (i < n && fade_opts[i] <= v + 1e-9)
+        return fade_opts[(i + dir + n) % n];
+    if (dir > 0) return i < n ? fade_opts[i] : fade_opts[n - 1];
+    return i > 0 ? fade_opts[i - 1] : fade_opts[0];
+}
+
 static const char *tab_name(int t) {
     static const char *const names[] = { "Tracks", "Albums", "Folders", "Artists" };
     return (t >= 0 && t < 4) ? names[t] : names[0];
@@ -348,6 +455,12 @@ static void load_settings(void) {
         else if (!strcmp(ln, "scxyview"))   sc_xyview = (n != 0);
         else if (!strcmp(ln, "shuffle"))    shuffle = (n != 0);
         else if (!strcmp(ln, "repeat"))     { if (n >= 0 && n < 3) repeat = n; }
+        else if (!strcmp(ln, "fadein"))     { fade_in  = atof(v); if (fade_in  < 0) fade_in  = 0; if (fade_in  > 60) fade_in  = 60; }
+        else if (!strcmp(ln, "fadeout"))    { fade_out = atof(v); if (fade_out < 0) fade_out = 0; if (fade_out > 60) fade_out = 60; }
+        else if (!strncmp(ln, "bind_", 5))  {
+            int i = atoi(ln + 5);
+            if (i >= 0 && i < KB_COUNT && n > 0) kb_key[i] = n;
+        }
     }
     fclose(f);
 }
@@ -362,6 +475,8 @@ static void save_settings(void) {
     fprintf(f, "scope=%d\nscmode=%d\nscspan=%d\nscgain=%d\nsctrig=%d\nscstyle=%d\nscfps=%d\nscdelay=%d\n",
             scope_on, sc_mode, sc_span, sc_gain, sc_trig, sc_blocks, sc_fps, sc_delay);
     fprintf(f, "sccolx=%s\nsccoly=%s\nscsmooth=%d\nscxyview=%d\n", col[3].code, col[4].code, sc_smooth, sc_xyview);
+    fprintf(f, "fadein=%.2f\nfadeout=%.2f\n", fade_in, fade_out);
+    for (int i = 0; i < KB_COUNT; i++) fprintf(f, "bind_%d=%d\n", i, kb_key[i]);
     if (music_dir[0]) fprintf(f, "music=%s\nmusicfrom=%s\n", music_dir, music_from);
     fclose(f);
 }
@@ -382,6 +497,8 @@ static void setting_step(int dir) {
         case SET_SC_DELAY: sc_delay = cycle_opt(sc_delay_opts, 6, sc_delay, dir); break;
         case SET_SC_SMOOTH: sc_smooth = (sc_smooth + dir + 4) % 4; break;
         case SET_SC_XYVIEW: sc_xyview = !sc_xyview; break;
+        case SET_FADEIN:   fade_in  = cycle_fade(fade_in,  dir); break;
+        case SET_FADEOUT:  fade_out = cycle_fade(fade_out, dir); break;
         default: return;
     }
     set_msg = "saved";
@@ -392,6 +509,7 @@ static void settings_reset(void) {
     for (int i = 0; i < 5; i++) set_color(&col[i], col[i].def);
     seek_step = 5; vol_step = 5; start_tab = TAB_TRACKS;
     sc_mode = 0; sc_span = 50; sc_gain = 0; sc_trig = 1; sc_blocks = 0; sc_fps = 30; sc_delay = 200; sc_smooth = 3; sc_xyview = 1;
+    fade_in = fade_out = 0; kb_defaults(); kb_open = 0; kb_capture = 0;
     scope_on = 0; settings_rows();           /* experimental features go back to off */
     set_msg = "all settings reset";
     save_settings();
@@ -976,6 +1094,35 @@ static void stop_child(void) {
     paused = 0;
 }
 
+/* Build the ffplay audio filter that performs the fades, or "" for none.
+ * ffplay runs the track through its own filter chain, so no second process
+ * and no volume change outside aqua's stream is involved. A fade-out is
+ * placed at the end of the audio that is left after `startpos`; ffplay
+ * resets filter timestamps at -ss, so a seek keeps the fade at track end.
+ * `dur` < 0 (unknown length) can only take a fade-in. */
+static void fade_filter(char *buf, size_t n, double startpos, double dur) {
+    size_t o = 0;
+    buf[0] = '\0';
+    if (fade_in > 0 && startpos <= 0.0) {
+        int w = snprintf(buf, n, "afade=t=in:st=0:d=%.2f", fade_in);
+        if (w < 0) return;
+        if ((size_t)w >= n) return;          /* truncated: nothing to append to */
+        o = (size_t)w;
+    }
+    if (fade_out > 0 && dur > 0) {
+        double rem = dur - (startpos > 0 ? startpos : 0);
+        if (rem > 0.05) {
+            double st = rem - fade_out;
+            double d  = fade_out;
+            if (st < 0) st = 0;
+            if (d > rem) d = rem;
+            int w = snprintf(buf + o, n - o, "%safade=t=out:st=%.2f:d=%.2f",
+                             o ? "," : "", st, d);
+            if (w < 0 || (size_t)w >= n - o) buf[n - 1] = '\0';
+        }
+    }
+}
+
 static void play_track(int idx, double startpos) {
     if (idx < 0 || idx >= ntracks) return;
     stop_child();
@@ -994,19 +1141,23 @@ static void play_track(int idx, double startpos) {
     if (startpos > 0) snprintf(ss, sizeof ss, "%.2f", startpos);
     char vols[16];
     snprintf(vols, sizeof vols, "%d", vol);
+    char af[96];
+    fade_filter(af, sizeof af, startpos, tracks[idx].dur);
 
     pid_t pid = fork();
     if (pid == 0) {
         int n = open("/dev/null", O_WRONLY);
         if (n >= 0) { dup2(n, STDOUT_FILENO); dup2(n, STDERR_FILENO); }
-        if (startpos > 0)
-            execlp("ffplay", "ffplay", "-nodisp", "-autoexit",
-                   "-loglevel", "quiet", "-volume", vols, "-ss", ss,
-                   tracks[idx].path, (char *)NULL);
-        else
-            execlp("ffplay", "ffplay", "-nodisp", "-autoexit",
-                   "-loglevel", "quiet", "-volume", vols,
-                   tracks[idx].path, (char *)NULL);
+        char *av[16];
+        int ac = 0;
+        av[ac++] = "ffplay"; av[ac++] = "-nodisp"; av[ac++] = "-autoexit";
+        av[ac++] = "-loglevel"; av[ac++] = "quiet";
+        av[ac++] = "-volume"; av[ac++] = vols;
+        if (startpos > 0) { av[ac++] = "-ss"; av[ac++] = ss; }
+        if (af[0]) { av[ac++] = "-af"; av[ac++] = af; }
+        av[ac++] = tracks[idx].path;
+        av[ac] = NULL;
+        execvp("ffplay", av);
         _exit(127);
     }
     child = pid;
@@ -1185,7 +1336,7 @@ static void switch_tab(int t) {
     free(cur_album); cur_album = NULL;
     searching = 0; clear_query();
     if (tab == TAB_TRACKS) rebuild_view();
-    else if (tab == TAB_SETTINGS) { setsel = 0; editing = 0; set_msg = ""; settings_rows(); }
+    else if (tab == TAB_SETTINGS) { setsel = 0; editing = 0; kb_open = 0; kb_capture = 0; set_msg = ""; settings_rows(); }
     else if (tab == TAB_SCOPE) { /* nothing to build: scope_pump() starts the decoder */ }
     else { build_albums(); rebuild_albums_view(); alsel = 0; }
 }
@@ -1752,9 +1903,10 @@ static void draw(void) {
 
     int album_list = on_album_list();
     int settings = (tab == TAB_SETTINGS);
+    int kb = settings && kb_open;
     int scope = (tab == TAB_SCOPE);
-    int asel   = settings ? setsel    : scope ? 0 : album_list ? alsel   : sel;   /* active selection */
-    int acount = settings ? nset      : album_list ? nalview : nview;   /* active list length */
+    int asel   = kb ? kbsel : settings ? setsel    : scope ? 0 : album_list ? alsel   : sel;   /* active selection */
+    int acount = kb ? KB_COUNT : settings ? nset      : album_list ? nalview : nview;   /* active list length */
 
     /* keep the active selection on screen */
     if (asel < scroll_top) scroll_top = asel;
@@ -1785,7 +1937,15 @@ static void draw(void) {
     flush_line(&del, row++, line);
 
     /* ---- breadcrumb / search line ---- */
-    if (settings && editing == 2) {              /* a long path: keep the end you are typing in view */
+    if (settings && kb_open)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "Settings \xE2\x96\xB8 " AQUA "Keybinds" DGRAY "   %s" RESET,
+            kb_capture ? "press a key (esc cancels)" : "Enter: change   Backspace: reset   Esc: back");
+    else if (settings && editing == 3)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "%s seconds: " WHITE "%s" AQUA "\xE2\x96\x88" RESET
+            DGRAY "   0 = off" RESET, set_row() == SET_FADEIN ? "Fade in" : "Fade out", fbuf);
+    else if (settings && editing == 2) {              /* a long path: keep the end you are typing in view */
         int room = cols - 20;
         if (room < 10) room = 10;
         lo = emit(line, sizeof line, 0,
@@ -1874,6 +2034,32 @@ static void draw(void) {
             continue;
         }
         if (settings) {                          /* ---- settings row ---- */
+            if (kb) {                            /* ---- keybind editor row ---- */
+                if (r < KB_COUNT) {
+                    char kn[16];
+                    const char *ks = key_name(kb_key[r], kn, sizeof kn);
+                    int nw = cols - 13;
+                    if (nw < 8) nw = 8;
+                    if (r == kbsel)
+                        lo = emit(line, sizeof line, 0,
+                            INVAQ " %-*.*s %7s " RESET, nw, nw, kb_names[r], ks);
+                    else
+                        lo = emit(line, sizeof line, 0,
+                            " " WHITE "%-*.*s" RESET " %s%7s" RESET,
+                            nw, nw, kb_names[r], GRAY, ks);
+                } else if (r == KB_COUNT + 1)
+                    lo = emit(line, sizeof line, 0,
+                        "  " DGRAY "Enter: press the new key.  Backspace: back to the default.  Esc: Settings" RESET);
+                else if (r == KB_COUNT + 2)
+                    lo = emit(line, sizeof line, 0,
+                        "  " DGRAY "Built-in aliases (j/k, p, =, _, g/G, Home/End, PgUp/PgDn) keep working" RESET);
+                else {
+                    lo = 0;
+                    line[0] = '\0';
+                }
+                flush_line(&del, row++, line);
+                continue;
+            }
             if (r < nset) {
                 int id = set_vis[r];             /* which setting this line shows */
                 char vbuf[16] = "";
@@ -1892,6 +2078,9 @@ static void draw(void) {
                 else if (id == SET_SC_DELAY)  snprintf(vbuf, sizeof vbuf, "%dms", sc_delay);
                 else if (id == SET_SC_SMOOTH) val = sc_smooth_names[sc_smooth];
                 else if (id == SET_SC_XYVIEW) val = sc_xyview_names[sc_xyview];
+                else if (id == SET_FADEIN)    { if (fade_in  > 0) snprintf(vbuf, sizeof vbuf, "%.1fs", fade_in);  else val = "off"; }
+                else if (id == SET_FADEOUT)   { if (fade_out > 0) snprintf(vbuf, sizeof vbuf, "%.1fs", fade_out); else val = "off"; }
+                else if (id == SET_KEYBINDS)  val = "edit";
                 if (id == SET_MUSIC) {               /* a path gets the rest of the line */
                     int room = cols - 19, pl = (int)strlen(lib_dir);
                     if (room < 8) room = 8;
@@ -2048,7 +2237,17 @@ static void draw(void) {
     }
 
     /* help line */
-    if (settings && editing == 2)
+    if (settings && kb_open)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "%s" RESET,
+            kb_capture ? "press a key   " DGRAY "esc" GRAY " cancel"
+                       : DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " change  "
+                         DGRAY "backspace" GRAY " reset  " DGRAY "esc" GRAY " back");
+    else if (settings && editing == 3)
+        lo = emit(line, sizeof line, 0,
+            "  " DGRAY "type a length in seconds (0-60)   " DGRAY "\xE2\x86\xB5" GRAY " apply  "
+            DGRAY "esc" GRAY " cancel" RESET);
+    else if (settings && editing == 2)
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "type or paste a folder path   " DGRAY "\xE2\x86\xB5" GRAY " use it (aqua restarts on it)  "
             DGRAY "esc" GRAY " cancel  " DGRAY "empty" GRAY " = the folder aqua was started on" RESET);
@@ -2101,13 +2300,6 @@ static void draw(void) {
 }
 
 /* ---- input ---- */
-enum {
-    KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT,   /* arrows (CSI and SS3) */
-    KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN,
-    KEY_BTAB,                                      /* Shift-Tab */
-    KEY_IGNORE = -2                                /* consumed, no action */
-};
-
 static int read_byte(void) {
     unsigned char c;
     return (read(STDIN_FILENO, &c, 1) == 1) ? c : -1;
@@ -2176,6 +2368,7 @@ static void on_stop(int s) { (void)s; g_stop = 1; }
 int main(int argc, char **argv) {
     g_argv0 = argv[0];
     init_cache_path();
+    kb_defaults();
     load_settings();                     /* first: it may name the music folder */
     settings_rows();
 
@@ -2323,6 +2516,44 @@ int main(int argc, char **argv) {
         if (rv > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
             int k = read_key();
             int alist = on_album_list();
+
+            if (kb_open) {
+                /* ---- keybind editor ---- */
+                if (kb_capture) {
+                    if (k == 27) { kb_capture = 0; set_msg = "cancelled"; }
+                    else if (k == 3) { kb_capture = 0; }
+                    else if (k > 0) {
+                        kb_assign(k);
+                        kb_capture = 0;
+                        save_settings();
+                        set_msg = "key updated";
+                    }
+                } else {
+                    switch (k) {
+                        case KEY_UP: case 'k': if (kbsel > 0) kbsel--; break;
+                        case KEY_DOWN: case 'j': if (kbsel < KB_COUNT - 1) kbsel++; break;
+                        case KEY_HOME: case 'g': kbsel = 0; break;
+                        case KEY_END: case 'G': kbsel = KB_COUNT - 1; break;
+                        case '\r': case '\n': kb_capture = 1; set_msg = ""; break;
+                        case 127: case 8:
+                            kb_key[kbsel] = kb_def[kbsel];
+                            save_settings();
+                            set_msg = "default restored";
+                            break;
+                        case 27: case 'q': kb_open = 0; set_msg = ""; break;
+                        case 3: running = 0; break;
+                    }
+                }
+                draw();
+                last_draw = now_sec();
+                continue;
+            }
+
+            /* a custom key stands in for the action's built-in key; never
+             * while the user is typing text */
+            if (!searching && !(tab == TAB_SETTINGS && editing) && k > 0)
+                k = kb_translate(k);
+
             if (tab == TAB_SETTINGS && editing == 2) {
                 /* ---- typing a music folder ---- */
                 switch (k) {
@@ -2339,6 +2570,34 @@ int main(int argc, char **argv) {
                     default:
                         if (k >= 32 && k < 256 && k != 127 && plen < (int)sizeof(pbuf) - 1) {
                             pbuf[plen++] = (char)k; pbuf[plen] = '\0';
+                        }
+                        break;
+                }
+            } else if (tab == TAB_SETTINGS && editing == 3) {
+                /* ---- typing a fade length in seconds ---- */
+                switch (k) {
+                    case '\r': case '\n': {
+                        editing = 0;
+                        if (flen == 0) break;            /* nothing typed: keep the fade */
+                        double v = atof(fbuf);
+                        if (v < 0) v = 0;
+                        if (v > 60) v = 60;
+                        if (set_row() == SET_FADEIN) fade_in = v;
+                        else                         fade_out = v;
+                        save_settings();
+                        set_msg = v > 0 ? "fade saved" : "fade off";
+                        break;
+                    }
+                    case 27: editing = 0; break;                     /* esc: cancel */
+                    case 127: case 8:
+                        if (flen > 0) fbuf[--flen] = '\0';
+                        break;
+                    case 3: running = 0; break;
+                    default:
+                        if (((k >= '0' && k <= '9') || k == '.') &&
+                            flen < (int)sizeof(fbuf) - 1) {
+                            fbuf[flen++] = (char)k;
+                            fbuf[flen] = '\0';
                         }
                         break;
                 }
@@ -2385,6 +2644,14 @@ int main(int argc, char **argv) {
                         } else if (row_color(set_row())) {
                             editing = 1; elen = 0; ebuf[0] = '\0'; set_msg = "";
                             snprintf(eprev, sizeof eprev, "%s", row_color(set_row())->code);
+                        } else if (set_row() == SET_KEYBINDS) {
+                            kb_open = 1; kbsel = 0; kb_capture = 0; set_msg = "";
+                        } else if (set_row() == SET_FADEIN || set_row() == SET_FADEOUT) {
+                            if (k == KEY_RIGHT) setting_step(1);
+                            else {
+                                editing = 3; set_msg = "";
+                                fbuf[0] = '\0'; flen = 0;   /* type the new length */
+                            }
                         } else if (set_row() == SET_RESET) {
                             if (k != KEY_RIGHT) settings_reset();
                         } else setting_step(1);

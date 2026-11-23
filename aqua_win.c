@@ -2703,6 +2703,7 @@ int main(int argc, char **argv) {
                 switch (k) {
                     case '\r': case '\n': {
                         editing = 0;
+                        if (flen == 0) break;            /* nothing typed: keep the fade */
                         double v = atof(fbuf);
                         if (v < 0) v = 0;
                         if (v > 60) v = 60;
@@ -2773,10 +2774,8 @@ int main(int argc, char **argv) {
                         } else if (set_row() == SET_FADEIN || set_row() == SET_FADEOUT) {
                             if (k == KEY_RIGHT) setting_step(1);
                             else {
-                                double v = set_row() == SET_FADEIN ? fade_in : fade_out;
                                 editing = 3; set_msg = "";
-                                snprintf(fbuf, sizeof fbuf, "%.1f", v);
-                                flen = (int)strlen(fbuf);
+                                fbuf[0] = '\0'; flen = 0;   /* type the new length */
                             }
                         } else if (set_row() == SET_RESET) {
                             if (k != KEY_RIGHT) settings_reset();

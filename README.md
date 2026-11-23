@@ -43,6 +43,11 @@ lengths. Minimal aqua/black/gray interface, no animations.
   *once* after you stop pressing the key (not once per key repeat), and a
   change made while paused is applied on resume
 - **Shuffle** and **repeat** (off / all / one)
+- **Fade in / fade out** — up to 60 s at the start and end of each track, on
+  both ports (on Linux through ffplay's own `afade` filter, so nothing
+  restarts and no other application's volume is touched)
+- **Custom keybinds** — every action can be moved to a key of your choosing,
+  on both ports; the built-in aliases keep working
 - **Search** across title, artist, album and filename
 - **Flicker-free UI** — the screen is repainted as a diff (only the lines
   that changed, wrapped in synchronized updates), so an idle display emits
@@ -77,10 +82,28 @@ sudo apt install build-essential ffmpeg
 
 ```sh
 make                 # builds ./aqua
+make test            # runs the unit tests (fades, keybinds, settings)
 make install         # installs to ~/.local/bin/aqua  (override PREFIX=...)
+make dist            # packages dist/aqua-<version>-linux-x86_64.tar.gz
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
+
+### Linux release tarball
+
+`make dist` builds `aqua` and packages it with its source, `Makefile`,
+`README.md`, `LICENSE` and the test source as
+`dist/aqua-<version>-linux-x86_64.tar.gz`. The version comes from the latest
+git tag (`git describe --tags --abbrev=0`), or pass it explicitly:
+
+```sh
+make dist VERSION=v1.5.0
+tar tzf dist/aqua-v1.5.0-linux-x86_64.tar.gz
+```
+
+The binary is built on the machine that runs `make dist`, so build the tarball
+on the oldest distribution you want it to run on (glibc is the only
+requirement; nothing else is linked).
 
 ## Windows
 
@@ -149,8 +172,8 @@ shortcut or shell alias that always passes one folder keeps your choice. A
 | `PgUp` / `PgDn`| move a page            |
 | `q` / `Ctrl-C` | quit                    |
 
-On Windows every action in the table can also be reached with a key of your
-choosing: see **Settings → Custom keybinds** below.
+Every action in the table can also be reached with a key of your choosing, on
+both ports: see **Settings → Custom keybinds** below.
 
 ### Tabs
 
@@ -225,9 +248,9 @@ The last tab. `↑↓` pick a row, `Enter` changes it, `←`/`→` step option r
 | **Scope X-Y smoothing** | low-pass before drawing: off / light / medium / heavy |
 | **Scope X color (left)** | color code for the wave, the left channel in Stereo, and the newest part of the X-Y curve; `default` follows the accent |
 | **Scope Y color (right)** | color code for the right channel in Stereo and the X-Y tail; `default` follows the accent |
-| **Fade in** | `off`, or a length in seconds: the Windows port ramps the track up from silence when it starts. `Enter` types a value (`0` = off), `←`/`→` step through the presets |
-| **Fade out** | `off`, or a length in seconds: the Windows port ramps the track down to silence over its last seconds |
-| **Custom keybinds** | `Enter` opens the keybind editor (Windows port) |
+| **Fade in** | `off`, or a length in seconds: the track comes up from silence when it starts (not after a seek). `Enter` then types a value (`0` = off, up to `60`; an empty field keeps the current one), `←`/`→` step through the presets 0/1/2/3/5/8/10/15/20/30 |
+| **Fade out** | `off`, or a length in seconds: the track goes down to silence over its last seconds, including after a seek |
+| **Custom keybinds** | `Enter` opens the keybind editor |
 | **Reset all settings** | back to the defaults above (the music folder is kept) |
 
 Colors are typed as a code:
@@ -242,15 +265,16 @@ Everything is saved to `~/.config/aqua/settings` on Linux and
 `%LOCALAPPDATA%\aqua\settings` on Windows. Playback keys (`Space`, `n`/`b`,
 `-`/`+`) keep working in this tab.
 
-### Custom keybinds (Windows)
+### Custom keybinds
 
 **Settings → Custom keybinds**, then `Enter`. The editor lists every action
 with its key. `↑↓` pick an action, `Enter` then press the key you want,
 `Backspace` restores the default, `Esc` goes back to Settings. Changing an
 action to a key another action uses swaps the two. Everything is saved to
-`%LOCALAPPDATA%\aqua\settings` and applies everywhere: the new key performs
-the action in any tab, and the built-in aliases (`j`/`k`, `p`, `=`, `_`,
-`g`/`G`, `Home`/`End`, `PgUp`/`PgDn`) keep working as well.
+`~/.config/aqua/settings` (Linux) or `%LOCALAPPDATA%\aqua\settings` (Windows)
+and applies everywhere: the new key performs the action in any tab, and the
+built-in aliases (`j`/`k`, `p`, `=`, `_`, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn`)
+keep working as well.
 
 ### Search
 
@@ -263,11 +287,30 @@ filter active, `Esc` in normal mode clears it too.
 next/prev (and auto-advance and shuffle) move only through the matching
 tracks. Clear the filter and the queue returns to the full library.
 
+### Fades
+
+Both ports fade the track itself, never the system volume, so other
+applications keep their level and no extra process is involved.
+
+- **Windows** ramps the Core Audio session volume of the running `ffplay`
+  from a timer in aqua, which is why a fade there follows a seek too.
+- **Linux** passes an `-af` filter chain to `ffplay`
+  (`afade=t=in:st=0:d=…` and `afade=t=out:st=…:d=…`). ffplay resets filter
+  timestamps when it starts at a seek offset, so the fade-out is placed at
+  the length of the audio that remains: it always lands on the end of the
+  track, seek or no seek. A fade-in only plays when the track starts from the
+  beginning. Tracks whose length `ffprobe` could not read get a fade-in only.
+
+Fades take effect on the next track (or the next seek); changing them never
+interrupts what is playing.
+
 ## How it works
 
 - Playback is an `ffplay -nodisp -autoexit` child process. Pause suspends it
   (`SIGSTOP`/`SIGCONT` on Linux, thread suspend/resume on Windows);
-  next/seek replace it. `Ctrl-C` and terminal close quit through the normal
+  next/seek replace it. Fades are handed to that same process (a filter chain
+  on Linux, a volume ramp on Windows), so they never add a second decoder.
+  `Ctrl-C` and terminal close quit through the normal
   exit path: ffplay is stopped, the metadata cache is written, and the
   terminal is restored — no raw-terminal leftovers, no orphaned audio.
 - Metadata (duration + title/artist/album/track) is read with `ffprobe`

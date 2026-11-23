@@ -5,9 +5,15 @@
 # objects
 *.o
 
+# test binary
+/tests/test_aqua
+
 # editor / local tooling
 .claude/
 *.swp
 
 # Windows Copilot-key package build output
 windows-copilot-key/build/
+
+# release tarballs
+/dist/
