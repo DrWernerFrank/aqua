@@ -1,8 +1,9 @@
 # ♬ aqua
 
-A tiny, fast terminal music player. One C file per platform, no libraries, no
-GUI — it shells out to **ffplay** for audio and uses **ffprobe** for track
-lengths. Minimal aqua/black/gray interface, no animations.
+A tiny, fast terminal music player. One C file, one codebase for Linux and
+Windows, no libraries, no GUI — it shells out to **ffplay** for audio and uses
+**ffprobe** for track lengths. Minimal aqua/black/gray interface, no
+animations.
 
 ```
   ♬ AQUA   1024 tracks
@@ -44,10 +45,10 @@ lengths. Minimal aqua/black/gray interface, no animations.
   change made while paused is applied on resume
 - **Shuffle** and **repeat** (off / all / one)
 - **Fade in / fade out** — up to 60 s at the start and end of each track, on
-  both ports (on Linux through ffplay's own `afade` filter, so nothing
+  both platforms (on Linux through ffplay's own `afade` filter, so nothing
   restarts and no other application's volume is touched)
 - **Custom keybinds** — every action can be moved to a key of your choosing,
-  on both ports; the built-in aliases keep working
+  on both platforms; the built-in aliases keep working
 - **Search** across title, artist, album and filename
 - **Flicker-free UI** — the screen is repainted as a diff (only the lines
   that changed, wrapped in synchronized updates), so an idle display emits
@@ -55,7 +56,7 @@ lengths. Minimal aqua/black/gray interface, no animations.
 - **Metadata cache** — only new or modified files are re-probed, so large
   libraries open instantly; files ffprobe can't read are cached with an
   unknown duration so they aren't re-probed every launch either
-- Tiny: one C file per platform, no build dependencies beyond libc/Win32
+- Tiny: one C file for both platforms, no build dependencies beyond libc/Win32
 - **Small memory footprint** — a 5,000-track library with a warm cache sits
   around 3 MB RSS on Linux and ~5 MB working set on Windows (about 180 bytes
   per track): repeated names (artist, album, folder) are stored once and
@@ -63,7 +64,7 @@ lengths. Minimal aqua/black/gray interface, no animations.
 
 ## Requirements
 
-- A C compiler (`cc`/`gcc`) and `make`
+- A C compiler (`cc`/`gcc`/MinGW-w64) and `make`
 - [`ffmpeg`](https://ffmpeg.org/) — provides `ffplay` (playback),
   `ffprobe` (durations + tags) and `ffmpeg` itself (samples for the
   experimental oscilloscope)
@@ -107,15 +108,15 @@ requirement; nothing else is linked).
 
 ## Windows
 
-A native Windows port lives in **`aqua_win.c`** (no WSL, no Cygwin). It swaps
-the POSIX platform layer for the Win32 Console API + VT sequences,
-`CreateProcess` + Toolhelp thread-suspend (in place of `fork`/`SIGSTOP`),
-`QueryPerformanceCounter`, and `_kbhit`/`_getch`. The metadata cache lives in
-`%LOCALAPPDATA%\aqua\library.tsv`. Volume is changed live through the Windows
-Core Audio session of the running `ffplay` process, so `+`/`-` never restart
-playback. That level is the one you see for `ffplay.exe` in the Windows Volume
-Mixer; Windows remembers it between tracks and runs, and aqua picks it up at
-startup instead of resetting it to 100%.
+The same **`aqua.c`** builds natively on Windows (no WSL, no Cygwin): the
+POSIX platform layer is swapped at compile time for the Win32 Console API + VT
+sequences, `CreateProcess` + Toolhelp thread-suspend (in place of
+`fork`/`SIGSTOP`), `QueryPerformanceCounter`, and `_kbhit`/`_getch`. The
+metadata cache lives in `%LOCALAPPDATA%\aqua\library.tsv`. Volume is changed
+live through the Windows Core Audio session of the running `ffplay` process,
+so `+`/`-` never restart playback. That level is the one you see for
+`ffplay.exe` in the Windows Volume Mixer; Windows remembers it between tracks
+and runs, and aqua picks it up at startup instead of resetting it to 100%.
 
 Every child process (`ffplay`, the optional scope decoder, `ffprobe`) is
 placed in a Windows job object with `KILL_ON_JOB_CLOSE`, so closing aqua from
@@ -125,7 +126,7 @@ running copy to quit first (and waits for it).
 
 ```powershell
 # Requirements: a MinGW-w64 gcc, plus ffmpeg on PATH (winget install Gyan.FFmpeg)
-gcc -O2 -Wall -o aqua.exe aqua_win.c
+gcc -O2 -Wall -o aqua.exe aqua.c
 aqua.exe "%USERPROFILE%\Music"
 ```
 
@@ -136,7 +137,7 @@ Or run **`install-windows.ps1`** (in this repo) to build, install to
 powershell -ExecutionPolicy Bypass -File install-windows.ps1
 ```
 
-Both ports share one design and one metadata format; the Linux and Windows
+Both platforms share one source and one metadata format; the Linux and Windows
 caches are interchangeable, so a library scanned on one is instant on the
 other (over a shared drive).
 
@@ -173,7 +174,7 @@ shortcut or shell alias that always passes one folder keeps your choice. A
 | `q` / `Ctrl-C` | quit                    |
 
 Every action in the table can also be reached with a key of your choosing, on
-both ports: see **Settings → Custom keybinds** below.
+both platforms: see **Settings → Custom keybinds** below.
 
 ### Tabs
 
@@ -289,7 +290,7 @@ tracks. Clear the filter and the queue returns to the full library.
 
 ### Fades
 
-Both ports fade the track itself, never the system volume, so other
+Both platforms fade the track itself, never the system volume, so other
 applications keep their level and no extra process is involved.
 
 - **Windows** ramps the Core Audio session volume of the running `ffplay`

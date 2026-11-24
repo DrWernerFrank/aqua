@@ -1,14 +1,50 @@
 /* aqua — a tiny, fast terminal music player.
  *
- * Zero library dependencies (just POSIX + ANSI escapes). Uses ffplay for
- * audio output and ffprobe for durations, both from ffmpeg.
+ * One source file for every platform. The whole player below is shared; only
+ * the small platform layer at the edges differs, selected by the compiler:
  *
- * Palette: aqua (cyan), black, gray. No animations.
+ *                    Linux / POSIX            Windows
+ *   terminal         termios + ANSI           Console API + VT sequences
+ *   input            select() on stdin        _kbhit()/_getch()
+ *   children         fork/exec + SIGSTOP      CreateProcess + thread suspend
+ *   clock            clock_gettime(MONO)      QueryPerformanceCounter
+ *   volume           pactl/wpctl/amixer       Core Audio session of ffplay
+ *   fades            ffplay afade filter      session-volume ramp
+ *   cache            ~/.cache/aqua            %LOCALAPPDATA%\aqua
  *
- * Build:  make      (or: cc -O2 -o aqua aqua.c)
- * Run:    ./aqua [directory]   (defaults to current directory)
+ * Audio output is always ffplay and durations/tags always ffprobe (ffmpeg).
+ * Build:  make           (or: cc -O2 -o aqua aqua.c; gcc -O2 -o aqua.exe aqua.c)
+ * Run:    aqua [directory]   (defaults to current directory)
  */
 
+#ifdef _WIN32
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <dirent.h>       /* MinGW-w64 provides a POSIX dirent */
+#include <direct.h>       /* _mkdir */
+#include <io.h>
+#include <fcntl.h>
+#include <conio.h>        /* _kbhit / _getch */
+#define COBJMACROS
+#include <windows.h>
+#include <tlhelp32.h>     /* Toolhelp: suspend/resume a child's threads */
+#include <mmdeviceapi.h>  /* Core Audio: per-process volume without a restart */
+#include <audiopolicy.h>
+
+/* MinGW exposes the case-insensitive comparisons under different names */
+#define strcasecmp  _stricmp
+#define strncasecmp _strnicmp
+
+/* how long the idle loop may sleep: Windows needs a steady tick for fades
+ * and audio-session retries (it has no select() to wake on input) */
+#define PLAT_MAX_IDLE_MS 25
+#define PLAT_SCOPE_MS 4
+#else
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +69,11 @@
 #include <malloc.h>   /* malloc_trim: hand freed cache pages back to the OS */
 #endif
 
+/* the idle loop can block in select() this long; a key wakes it at once */
+#define PLAT_MAX_IDLE_MS 250
+#define PLAT_SCOPE_MS 8
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -46,9 +87,9 @@
 #define RESET  "\033[0m"
 #define INVAQ  "\033[7;38;5;44m"   /* reverse aqua = selected row */
 
-/* ---- keys ---- */
+/* key codes for keys that don't arrive as a single byte */
 enum {
-    KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT,   /* arrows (CSI and SS3) */
+    KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT,   /* arrows */
     KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN,
     KEY_BTAB,                                      /* Shift-Tab */
     KEY_IGNORE = -2                                /* consumed, no action */
@@ -72,23 +113,6 @@ typedef struct {
     int   trackno;  /* track number, 0 if unknown */
     int   probed;   /* 1 once ffprobe answered (even "no duration"), or cache hit */
 } Track;
-
-/* filename without extension, derived from path (no stored copy) */
-static const char *track_name(const Track *t, char *buf, size_t n) {
-    const char *p = strrchr(t->path, '/');
-    p = p ? p + 1 : t->path;
-    const char *dot = strrchr(p, '.');
-    size_t L = dot ? (size_t)(dot - p) : strlen(p);
-    if (L >= n) L = n - 1;
-    memcpy(buf, p, L);
-    buf[L] = '\0';
-    return buf;
-}
-
-/* display title: prefer the tag title, fall back to the filename */
-static const char *disp_title(const Track *t, char *buf, size_t n) {
-    return (t->title && *t->title) ? t->title : track_name(t, buf, n);
-}
 
 static Track *tracks = NULL;
 static int ntracks = 0, capacity = 0;
@@ -213,11 +237,17 @@ static int kbsel = 0;                    /* selection in the keybind editor */
 static int kb_capture = 0;               /* 1 = waiting for the next key press */
 
 /* ---- fades ----
- * 0 = off; otherwise the length in seconds. ffplay applies the fade in its
- * own filter chain (see fade_filter), so it never restarts the stream and
- * never touches another application's volume. */
+ * 0 = off; otherwise the length in seconds. The track itself fades, never the
+ * system volume. On Linux ffplay runs the fade in its own filter chain (see
+ * fade_filter); on Windows aqua ramps the Core Audio session volume (see
+ * fade_tick). Neither restarts the stream or touches another application. */
 static double fade_in  = 0.0;
 static double fade_out = 0.0;
+#ifdef _WIN32
+static double fade_mult = 1.0;           /* current fade level, 0..1 */
+static int    fade_in_active = 0;        /* this track started with a fade-in */
+static double fade_start_pos = 0;        /* track position the fade-in began at */
+#endif
 
 static void kb_defaults(void) {
     for (int i = 0; i < KB_COUNT; i++) kb_key[i] = kb_def[i];
@@ -306,7 +336,7 @@ static int set_row(void) {
     if (!nset) settings_rows();
     return set_vis[setsel < nset ? setsel : nset - 1];
 }
-static int  editing = 0;                 /* 1 while typing a colour code */
+static int  editing = 0;                 /* 1 colour code, 2 music folder, 3 fade seconds */
 static char ebuf[12] = "";               /* the code being typed */
 static int  elen = 0;
 static char eprev[12] = "";              /* colour to restore if editing is cancelled */
@@ -366,6 +396,19 @@ static int set_color(Color *c, const char *code) {
 
 static const int seek_opts[] = { 5, 10, 15, 30, 60 };
 static const int vol_opts[]  = { 1, 2, 5, 10 };
+static const double fade_opts[] = { 0, 1, 2, 3, 5, 8, 10, 15, 20, 30 };
+
+/* step a fade length through the presets; a typed value between two presets
+ * moves to the next one in the chosen direction */
+static double cycle_fade(double v, int dir) {
+    int n = (int)(sizeof fade_opts / sizeof fade_opts[0]);
+    int i = 0;
+    while (i < n && fade_opts[i] < v - 1e-9) i++;
+    if (i < n && fade_opts[i] <= v + 1e-9)
+        return fade_opts[(i + dir + n) % n];
+    if (dir > 0) return i < n ? fade_opts[i] : fade_opts[n - 1];
+    return i > 0 ? fade_opts[i - 1] : fade_opts[0];
+}
 
 /* oscilloscope tab (see "oscilloscope" below) */
 static const char *const sc_mode_names[] = { "Wave", "Stereo", "X-Y" };
@@ -400,21 +443,6 @@ static int cycle_opt(const int *opts, int n, int v, int dir) {
     while (i < n && opts[i] != v) i++;
     if (i == n) return opts[0];
     return opts[(i + dir + n) % n];
-}
-
-/* fade lengths offered by the Settings rows, in seconds (0 = off) */
-static const double fade_opts[] = { 0, 1, 2, 3, 5, 8, 10, 15, 20, 30 };
-
-/* step a fade length through the presets; a typed value between two presets
- * lands on the next one in the direction of travel */
-static double cycle_fade(double v, int dir) {
-    int n = (int)(sizeof fade_opts / sizeof fade_opts[0]);
-    int i = 0;
-    while (i < n && fade_opts[i] < v - 1e-9) i++;
-    if (i < n && fade_opts[i] <= v + 1e-9)
-        return fade_opts[(i + dir + n) % n];
-    if (dir > 0) return i < n ? fade_opts[i] : fade_opts[n - 1];
-    return i > 0 ? fade_opts[i - 1] : fade_opts[0];
 }
 
 static const char *tab_name(int t) {
@@ -514,7 +542,105 @@ static void settings_reset(void) {
     set_msg = "all settings reset";
     save_settings();
 }
-static pid_t child = -1;     /* ffplay pid, -1 = none */
+
+/* ---- process lifetime ----
+ * Nothing may outlive aqua: a crash, a closed window or ^C must take the
+ * audio with it, and a second launch must not leave the first one playing.
+ * Windows does this with a kill-on-close job plus a named mutex/event; POSIX
+ * with SIGINT/SIGTERM/SIGHUP handlers that leave through the normal path. */
+#ifdef _WIN32
+/* Every child (ffplay, the scope decoder, ffprobe) is put in one job with
+ * KILL_ON_JOB_CLOSE. If aqua dies for any reason - q, the window's X button,
+ * Task Manager, a crash - Windows closes the job and takes the children with
+ * it, so no ffplay is left playing in the background. */
+static HANDLE g_job = NULL;
+
+static void job_init(void) {
+    g_job = CreateJobObjectA(NULL, NULL);
+    if (!g_job) return;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+    memset(&li, 0, sizeof li);
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &li, sizeof li);
+}
+
+static void job_add(HANDLE h) {
+    if (g_job && h) AssignProcessToJobObject(g_job, h);
+}
+
+/* Opening aqua again asks the running copy to quit (it stops ffplay on the
+ * way out) and waits for it, so a second launch doesn't leave the first
+ * one's audio playing underneath it. */
+static HANDLE g_instance = NULL, g_quit_ev = NULL;
+
+static void instance_init(void) {
+    g_instance = CreateMutexA(NULL, TRUE, "Local\\aqua.single");
+    int first = !(g_instance && GetLastError() == ERROR_ALREADY_EXISTS);
+    g_quit_ev = CreateEventA(NULL, TRUE, FALSE, "Local\\aqua.quit");
+    if (first) {
+        if (g_quit_ev) ResetEvent(g_quit_ev);
+    } else {
+        if (g_quit_ev) SetEvent(g_quit_ev);
+        if (g_instance) {
+            DWORD w = WaitForSingleObject(g_instance, 3000);
+            if ((w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) && g_quit_ev)
+                ResetEvent(g_quit_ev);
+        }
+    }
+}
+
+static int instance_quit_requested(void) {
+    return g_quit_ev && WaitForSingleObject(g_quit_ev, 0) == WAIT_OBJECT_0;
+}
+
+static void instance_release(void) {
+    if (g_instance) { ReleaseMutex(g_instance); CloseHandle(g_instance); g_instance = NULL; }
+    if (g_quit_ev)  { CloseHandle(g_quit_ev); g_quit_ev = NULL; }
+}
+
+/* Ctrl-Break / console close: leave via the normal exit path so the cache
+ * is written and the console is restored (Ctrl-C itself arrives as byte 3,
+ * because ENABLE_PROCESSED_INPUT is off). */
+static volatile int g_stop = 0;
+static BOOL WINAPI on_console_ctrl(DWORD ev) {
+    (void)ev;
+    g_stop = 1;
+    return TRUE;                        /* we'll exit cleanly on our own */
+}
+
+static void platform_init(void) {
+    job_init();
+    instance_init();
+    SetConsoleCtrlHandler(on_console_ctrl, TRUE);
+}
+
+static void platform_release(void) { instance_release(); }
+#else
+/* ^C (and TERM/HUP) must leave via the normal exit path: dying by default
+ * action would leave the terminal raw, ffplay running, and the metadata
+ * cache unsaved. */
+static volatile sig_atomic_t g_stop = 0;
+static void on_stop(int s) { (void)s; g_stop = 1; }
+static int instance_quit_requested(void) { return 0; }
+
+static void platform_init(void) {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, on_stop);
+    signal(SIGTERM, on_stop);
+    signal(SIGHUP, on_stop);
+}
+
+static void platform_release(void) { }
+static const char *g_argv0 = "aqua";     /* how we were started, to start over the same way */
+#endif
+
+/* ---- child (ffplay) control ---- */
+#ifdef _WIN32
+static HANDLE child_h = NULL;   /* ffplay process handle, NULL = none */
+static DWORD  child_pid = 0;
+#else
+static pid_t child = -1;        /* ffplay pid, -1 = none */
+#endif
 static int paused = 0;
 static int intentional = 0;  /* we killed ffplay, don't auto-advance */
 static int play_gen = 0;     /* bumped on every (re)start: the scope decoder follows it */
@@ -524,6 +650,7 @@ enum { REP_OFF, REP_ALL, REP_ONE };
 static int repeat = REP_OFF; /* off / repeat-all (loop queue) / repeat-one (track) */
 static int shuffle = 0;      /* random play order */
 
+#ifndef _WIN32
 /* Volume backends, tried in this order. `volume` is the authority; the chosen
  * backend applies it live. ffplay itself carries the volume only when no
  * backend exists (VOL_NONE), where a debounced restart is the only way to
@@ -533,18 +660,26 @@ static int vol_backend = VOL_NONE;
 static int vol_dirty = 0;        /* pactl: the running stream lacks `volume` */
 static int vol_fails = 0;        /* consecutive backend failures -> degrade */
 static int spawned_vol = 100;    /* -volume the running ffplay started with */
-static double restart_at = 0;   /* debounced volume restart, 0 = none */
+static double restart_at = 0;    /* debounced volume restart, 0 = none */
+#endif
 
 /* play queue: the sequence next/prev walk through. It mirrors the current
  * view[] (so search results become the queue), optionally shuffled. */
 static int *queue = NULL;
 static int nqueue = 0;
 
-/* playback clock */
-static struct timespec t_start;
+/* playback clock (seconds, monotonic) */
+static double t_start_sec = 0;
 static double base_elapsed = 0;
 
+/* ---- console state ---- */
+#ifdef _WIN32
+static HANDLE hOut = INVALID_HANDLE_VALUE, hIn = INVALID_HANDLE_VALUE;
+static DWORD  orig_out_mode = 0, orig_in_mode = 0;
+static UINT   orig_out_cp = 0;
+#else
 static struct termios orig_termios;
+#endif
 
 /* ---- extensions ---- */
 static int is_audio(const char *name) {
@@ -557,6 +692,43 @@ static int is_audio(const char *name) {
     for (int i = 0; ext[i]; i++)
         if (strcasecmp(dot, ext[i]) == 0) return 1;
     return 0;
+}
+
+/* last path separator: Windows paths mix / and \, POSIX only uses / */
+static char *last_sep(char *s) {
+    char *a = strrchr(s, '/');
+#ifdef _WIN32
+    char *b = strrchr(s, '\\');
+    return (a > b) ? a : b;
+#else
+    return a;
+#endif
+}
+
+/* filename without extension, derived from path (no stored copy) */
+static const char *track_name(const Track *t, char *buf, size_t n) {
+    const char *p = last_sep(t->path);
+    p = p ? p + 1 : t->path;
+    const char *dot = strrchr(p, '.');
+    size_t L = dot ? (size_t)(dot - p) : strlen(p);
+    if (L >= n) L = n - 1;
+    memcpy(buf, p, L);
+    buf[L] = '\0';
+    return buf;
+}
+
+/* display title: prefer the tag title, fall back to the filename */
+static const char *disp_title(const Track *t, char *buf, size_t n) {
+    return (t->title && *t->title) ? t->title : track_name(t, buf, n);
+}
+
+/* canonical absolute path, or NULL if it cannot be resolved */
+static const char *abs_path(const char *p, char *out) {
+#ifdef _WIN32
+    return _fullpath(out, p, PATH_MAX) ? out : NULL;
+#else
+    return realpath(p, out);
+#endif
 }
 
 /* ---- collection ---- */
@@ -676,11 +848,25 @@ static void free_intern(void) {
 
 static void add_track(const char *path) {
     if (ntracks == capacity) {
+        int newcap = capacity ? capacity * 2 : 4096;
+#ifdef _WIN32
+        /* grow via VirtualAlloc: the old block is released to the OS on the
+         * spot, where a CRT realloc would leave the freed copy committed */
+        Track *nu = VirtualAlloc(NULL, (SIZE_T)newcap * sizeof(Track),
+                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!nu) { fprintf(stderr, "out of memory\n"); exit(1); }
+        if (tracks) {
+            memcpy(nu, tracks, (size_t)ntracks * sizeof(Track));
+            VirtualFree(tracks, 0, MEM_RELEASE);
+        }
+        tracks = nu;
+#else
         /* start big: a single large (page-mapped) block instead of a ladder
          * of small reallocs whose freed copies would stay resident */
-        capacity = capacity ? capacity * 2 : 4096;
-        tracks = realloc(tracks, capacity * sizeof(Track));
+        tracks = realloc(tracks, (size_t)newcap * sizeof(Track));
         if (!tracks) { perror("realloc"); exit(1); }
+#endif
+        capacity = newcap;
     }
     Track *t = &tracks[ntracks++];
     t->path = strpool(path);
@@ -688,10 +874,10 @@ static void add_track(const char *path) {
     /* parent folder name (album fallback), shared by every track in it */
     char pbuf[2048];
     snprintf(pbuf, sizeof pbuf, "%s", path);
-    char *slash = strrchr(pbuf, '/');           /* strip filename */
+    char *slash = last_sep(pbuf);                /* strip filename */
     if (slash) {
         *slash = '\0';
-        char *par = strrchr(pbuf, '/');          /* parent dir basename */
+        char *par = last_sep(pbuf);              /* parent dir basename */
         t->folder = intern(par ? par + 1 : pbuf);
     } else {
         t->folder = intern("");
@@ -762,12 +948,14 @@ static void music_apply(void) {
         return;
     }
     char abs[PATH_MAX];
+#ifndef _WIN32
     char ex[PATH_MAX];
     if (p[0] == '~' && (p[1] == '/' || p[1] == '\0') && getenv("HOME")) {   /* no shell here to expand ~ */
         snprintf(ex, sizeof ex, "%s%s", getenv("HOME"), p + 1);
         p = ex;
     }
-    if (!realpath(p, abs)) { set_msg = "no such folder"; return; }
+#endif
+    if (!abs_path(p, abs)) { set_msg = "no such folder"; return; }
     DIR *d = opendir(abs);
     if (!d) { set_msg = "that is not a folder"; return; }
     closedir(d);
@@ -809,10 +997,113 @@ static char *intern_clean(const char *s) {
 }
 
 /* ---- metadata via ffprobe (duration + title/artist/album/track) ----
- * ffprobe is exec'd directly with the path as a single argv element — there
- * is no shell between us and it, so filenames can't inject commands. Returns
- * 1 when the probe is definitive (ffprobe ran, even if it found no duration),
- * 0 when ffprobe itself couldn't run — the file is then retried next session. */
+ * ffprobe is launched directly with the path as one argv element (no shell,
+ * and no cmd.exe on Windows either), so filenames can't inject commands — a
+ * name like $(touch pwned).mp3 is just a name. Returns 1 when the probe is
+ * definitive (ffprobe ran, even if it found no duration), 0 when ffprobe
+ * itself couldn't run — the file is then retried next session. */
+
+/* append s to a Windows command line, quoted the way MSVCRT argv parsing
+ * expects: inner quotes are escaped and the backslashes before them doubled */
+#ifdef _WIN32
+static size_t quote_arg(char *dst, size_t cap, size_t o, const char *s) {
+    size_t nbs = 0;
+    if (o + 2 >= cap) return o;
+    dst[o++] = '"';
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\') {
+            if (o + 4 >= cap) break;
+            nbs++;
+            dst[o++] = '\\';
+        } else if (*p == '"') {
+            if (o + nbs + 3 >= cap) break;
+            while (nbs--) dst[o++] = '\\';     /* double pending backslashes */
+            nbs = 0;
+            dst[o++] = '\\'; dst[o++] = '"';
+        } else {
+            if (o + 2 >= cap) break;
+            nbs = 0;
+            dst[o++] = *p;
+        }
+    }
+    while (nbs-- && o + 1 < cap) dst[o++] = '\\';   /* double trailing ones */
+    if (o + 1 < cap) dst[o++] = '"';
+    dst[o] = '\0';
+    return o;
+}
+#endif
+
+static void probe_line(Track *t, char *line) {
+    char *eq = strchr(line, '=');
+    if (!eq) return;
+    *eq = '\0';
+    char *key = line, *val = eq + 1;
+    size_t L = strlen(val);
+    while (L && (val[L-1] == '\n' || val[L-1] == '\r')) val[--L] = '\0';
+    if (strcmp(key, "duration") == 0)             t->dur = atof(val) > 0 ? atof(val) : -1;
+    else if (strcasecmp(key, "TAG:title") == 0)   t->title  = dup_clean(val);
+    else if (strcasecmp(key, "TAG:artist") == 0)  t->artist = intern_clean(val);
+    else if (strcasecmp(key, "TAG:album") == 0)   t->album  = intern_clean(val);
+    else if (strcasecmp(key, "TAG:track") == 0)   t->trackno = atoi(val);  /* "3/12" -> 3 */
+}
+
+#ifdef _WIN32
+static int probe_meta(Track *t) {
+    char cmd[PATH_MAX + 256];
+    size_t o = snprintf(cmd, sizeof cmd,
+        "ffprobe -v error -show_entries "
+        "format=duration:format_tags=title,artist,album,track,TITLE,ARTIST,ALBUM,TRACK "
+        "-of default=noprint_wrappers=1 ");
+    o = quote_arg(cmd, sizeof cmd, o, t->path);
+    (void)o;
+
+    SECURITY_ATTRIBUTES sa; memset(&sa, 0, sizeof sa);
+    sa.nLength = sizeof sa; sa.bInheritHandle = TRUE;
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    HANDLE nul = CreateFileA("NUL", GENERIC_WRITE, 0, &sa, OPEN_EXISTING, 0, NULL);
+
+    STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError  = (nul != INVALID_HANDLE_VALUE) ? nul : wr;
+    si.hStdInput  = INVALID_HANDLE_VALUE;
+    PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(rd); CloseHandle(wr);
+        if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+        return 0;                        /* ffprobe missing: retried next run */
+    }
+    job_add(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(wr);                     /* our copy: child's stays open */
+
+    /* read the whole answer, then reap */
+    int definitive = 0;
+    char buf[1024], line[1024];
+    size_t lin = 0;
+    DWORD n;
+    while (ReadFile(rd, buf, sizeof buf, &n, NULL) && n) {
+        for (DWORD i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c != '\n' && lin + 1 < sizeof line) line[lin++] = c;
+            else {
+                line[lin] = '\0'; lin = 0;
+                probe_line(t, line);
+            }
+        }
+    }
+    if (lin) { line[lin] = '\0'; probe_line(t, line); }   /* unterminated tail */
+    if (WaitForSingleObject(pi.hProcess, 10000) == WAIT_OBJECT_0) definitive = 1;
+    CloseHandle(pi.hProcess);
+    CloseHandle(rd);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    apply_group(t);
+    return definitive;
+}
+#else
 static int probe_meta(Track *t) {
     int fds[2];
     if (pipe(fds) != 0) return 0;
@@ -834,19 +1125,7 @@ static int probe_meta(Track *t) {
     FILE *p = fdopen(fds[0], "r");
     if (p) {
         char line[1024];
-        while (fgets(line, sizeof line, p)) {
-            char *eq = strchr(line, '=');
-            if (!eq) continue;
-            *eq = '\0';
-            char *key = line, *val = eq + 1;
-            size_t L = strlen(val);
-            while (L && (val[L-1] == '\n' || val[L-1] == '\r')) val[--L] = '\0';
-            if (strcmp(key, "duration") == 0)             t->dur = atof(val) > 0 ? atof(val) : -1;
-            else if (strcasecmp(key, "TAG:title") == 0)   t->title  = dup_clean(val);
-            else if (strcasecmp(key, "TAG:artist") == 0) t->artist = intern_clean(val);
-            else if (strcasecmp(key, "TAG:album") == 0)  t->album  = intern_clean(val);
-            else if (strcasecmp(key, "TAG:track") == 0)  t->trackno = atoi(val);  /* "3/12" -> 3 */
-        }
+        while (fgets(line, sizeof line, p)) probe_line(t, line);
         fclose(p);
         int st = 0;
         if (waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) != 127)
@@ -858,8 +1137,12 @@ static int probe_meta(Track *t) {
     apply_group(t);
     return definitive;
 }
+#endif
 
-/* ---- metadata cache (~/.cache/aqua/library.tsv) ----
+/* ---- metadata cache ----
+ * Linux: ~/.cache/aqua/library.tsv (settings in ~/.config/aqua/settings)
+ * Windows: %LOCALAPPDATA%\aqua\library.tsv (settings beside it). The format
+ * is shared, so a library scanned on one platform is instant on the other.
  * Each line: <mtime>\t<dur>\t<trackno>\t<title>\t<artist>\t<album>\t<abspath>
  * Only new or modified files are probed; everything else is read from here.
  * Files ffprobe couldn't get a duration from are stored with dur -1 so they
@@ -879,6 +1162,18 @@ static int cmp_cache(const void *a, const void *b) {
 }
 
 static void init_cache_path(void) {
+#ifdef _WIN32
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !*base) base = getenv("USERPROFILE");
+    if (!base || !*base) base = ".";
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%.*s\\aqua", (int)(sizeof dir - 32), base);
+    _mkdir(dir);
+    snprintf(cache_file, sizeof cache_file, "%.*s\\library.tsv",
+             (int)(sizeof cache_file - 20), dir);
+    snprintf(settings_file, sizeof settings_file, "%.*s\\settings",
+             (int)(sizeof settings_file - 20), dir);
+#else
     const char *home = getenv("HOME");
     if (!home || !*home) home = ".";
     char dir[PATH_MAX];
@@ -895,6 +1190,7 @@ static void init_cache_path(void) {
     mkdir(dir, 0755);
     snprintf(settings_file, sizeof settings_file, "%.*s/settings",
              (int)(sizeof settings_file - 20), dir);
+#endif
 }
 
 /* take the next tab-delimited field, advancing *pp past the tab */
@@ -924,7 +1220,7 @@ static void put_escaped(FILE *f, const char *s) {
 static char *unescape_in(char *s) {
     char *w = s, *r = s;
     while (*r) {
-        if (r[0] == '\\' && r[1] == 'n')  { *w++ = '\n'; r += 2; }
+        if (r[0] == '\\' && r[1] == 'n')      { *w++ = '\n'; r += 2; }
         else if (r[0] == '\\' && r[1] == 't')  { *w++ = '\t'; r += 2; }
         else if (r[0] == '\\' && r[1] == 'r')  { *w++ = '\r'; r += 2; }
         else if (r[0] == '\\' && r[1] == '\\') { *w++ = '\\'; r += 2; }
@@ -940,6 +1236,25 @@ static char *unescape_in(char *s) {
  * hands the pages straight back instead of leaving heap holes. */
 static char *cache_buf = NULL;
 
+/* one-shot buffers: on Windows they come straight from the OS, so releasing
+ * them returns the pages at once; on POSIX malloc/free is enough. */
+static void *big_alloc(size_t n) {
+#ifdef _WIN32
+    return VirtualAlloc(NULL, n ? n : 1, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    return malloc(n ? n : 1);
+#endif
+}
+
+static void big_free(void *p) {
+    if (!p) return;
+#ifdef _WIN32
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    free(p);
+#endif
+}
+
 static void load_cache(void) {
     FILE *f = fopen(cache_file, "rb");
     if (!f) return;
@@ -947,20 +1262,23 @@ static void load_cache(void) {
     long sz = ftell(f);
     if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return; }
     if (sz == 0) { fclose(f); return; }
-    cache_buf = malloc((size_t)sz + 2);
+    /* one whole-file buffer: it is freed once, right after the merge */
+    cache_buf = big_alloc((size_t)sz + 2);
     if (!cache_buf) { fclose(f); return; }
     size_t got = fread(cache_buf, 1, (size_t)sz, f);
     fclose(f);
-    if (got == 0) { free(cache_buf); cache_buf = NULL; return; }
+    if (got == 0) { big_free(cache_buf); cache_buf = NULL; return; }
     cache_buf[got] = '\n';               /* every line ends with \n */
     cache_buf[got + 1] = '\0';
 
-    /* exact array size: no growth churn on load */
+    /* exact array size: no growth churn on load. Freed whole after the
+     * merge, so the pages return to the OS */
     int lines = 1;
     for (size_t i = 0; i < got; i++)
         if (cache_buf[i] == '\n') lines++;
     capcache = lines;
-    cache = xmalloc(capcache * sizeof(CacheEnt));
+    cache = big_alloc((size_t)capcache * sizeof(CacheEnt));
+    if (!cache) { big_free(cache_buf); cache_buf = NULL; return; }
 
     ncache = 0;
     char *p = cache_buf;
@@ -968,7 +1286,7 @@ static void load_cache(void) {
         char *nl = strchr(p, '\n');
         if (nl) *nl = '\0';
         else break;
-        if (nl > p && nl[-1] == '\r') nl[-1] = '\0';   /* CRLF caches (cross-platform files) */
+        if (nl > p && nl[-1] == '\r') nl[-1] = '\0';   /* CRLF caches (text-mode writes) */
         char *q = p;
         p = nl + 1;
         long  mt   = strtol(next_field(&q), NULL, 10);
@@ -987,7 +1305,7 @@ static void load_cache(void) {
         e->album  = *album  ? unescape_in(album)  : NULL;
         e->dead = 0;
     }
-    if (ncache == 0) { free(cache); cache = NULL; capcache = 0; }
+    if (ncache == 0) { big_free(cache); cache = NULL; capcache = 0; }
     if (ncache) qsort(cache, ncache, sizeof(CacheEnt), cmp_cache);
 }
 
@@ -1027,7 +1345,7 @@ static void save_cache(void) {
     for (int i = 0; i < ntracks; i++) {
         if (!tracks[i].probed) continue;
         char rp[PATH_MAX];
-        const char *ap = realpath(tracks[i].path, rp) ? rp : tracks[i].path;
+        const char *ap = abs_path(tracks[i].path, rp) ? rp : tracks[i].path;
         cache_upsert(&tracks[i], ap);
     }
     FILE *f = fopen(cache_file, "w");
@@ -1045,61 +1363,261 @@ static void save_cache(void) {
 
 /* ---- terminal ---- */
 static void term_raw(void) {
+#ifdef _WIN32
+    hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    hIn  = GetStdHandle(STD_INPUT_HANDLE);
+
+    if (GetConsoleMode(hOut, &orig_out_mode))
+        SetConsoleMode(hOut, orig_out_mode | ENABLE_PROCESSED_OUTPUT
+                                           | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    if (GetConsoleMode(hIn, &orig_in_mode))
+        SetConsoleMode(hIn, orig_in_mode & ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT
+                                           | ENABLE_PROCESSED_INPUT
+                                           | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT));
+
+    orig_out_cp = GetConsoleOutputCP();
+    SetConsoleOutputCP(CP_UTF8);          /* render the ♬ and box-drawing glyphs */
+    _setmode(_fileno(stdout), _O_BINARY); /* write our own \r\n, no translation */
+#else
     tcgetattr(STDIN_FILENO, &orig_termios);
     struct termios raw = orig_termios;
     raw.c_lflag &= ~(ECHO | ICANON);   /* ISIG stays on: ^C arrives as a signal */
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+#endif
     printf("\033[?25l");      /* hide cursor */
     fflush(stdout);
 }
 
 static void term_restore(void) {
+#ifdef _WIN32
+    if (col[SET_BG].sgr[0]) printf("\033[0m\033[2J\033[H");   /* don't leave our background behind */
+    printf("\033[?25h\033[0m\r\n");  /* show cursor */
+    fflush(stdout);
+    if (hOut != INVALID_HANDLE_VALUE) SetConsoleMode(hOut, orig_out_mode);
+    if (hIn  != INVALID_HANDLE_VALUE) SetConsoleMode(hIn,  orig_in_mode);
+    if (orig_out_cp) SetConsoleOutputCP(orig_out_cp);
+#else
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
     if (col[SET_BG].sgr[0]) printf("\033[0m\033[2J\033[H");   /* don't leave our background behind */
     printf("\033[?25h\033[0m\n");  /* show cursor */
     fflush(stdout);
+#endif
 }
 
 static void get_size(int *rows, int *cols) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+        *rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+        *cols = csbi.srWindow.Right  - csbi.srWindow.Left + 1;
+        if (*rows < 1) *rows = 24;
+        if (*cols < 1) *cols = 80;
+    } else { *rows = 24; *cols = 80; }
+#else
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row) {
         *rows = ws.ws_row; *cols = ws.ws_col;
     } else { *rows = 24; *cols = 80; }
+#endif
 }
 
 /* ---- playback clock ---- */
 static double now_sec(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
+#endif
 }
 
 static double elapsed(void) {
     if (cur < 0) return 0;
     if (paused) return base_elapsed;
-    return base_elapsed + (now_sec() - (t_start.tv_sec + t_start.tv_nsec / 1e9));
+    return base_elapsed + (now_sec() - t_start_sec);
 }
 
-/* ---- child control ---- */
-static void stop_child(void) {
-    if (child > 0) {
-        intentional = 1;
-        if (paused) kill(child, SIGCONT);
-        kill(child, SIGTERM);
-        waitpid(child, NULL, 0);
-        child = -1;
+/* ---- pause / resume ----
+ * Windows has no SIGSTOP; walk the thread table and Suspend/Resume each
+ * thread of the child. This is the faithful analogue of pause/continue. */
+#ifdef _WIN32
+static void suspend_process(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te; te.dwSize = sizeof te;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) {
+                HANDLE th = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (th) { SuspendThread(th); CloseHandle(th); }
+            }
+        } while (Thread32Next(snap, &te));
     }
-    paused = 0;
+    CloseHandle(snap);
+}
+static void resume_process(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te; te.dwSize = sizeof te;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) {
+                HANDLE th = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (th) { ResumeThread(th); CloseHandle(th); }
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
 }
 
-/* Build the ffplay audio filter that performs the fades, or "" for none.
- * ffplay runs the track through its own filter chain, so no second process
- * and no volume change outside aqua's stream is involved. A fade-out is
- * placed at the end of the audio that is left after `startpos`; ffplay
- * resets filter timestamps at -ss, so a seek keeps the fade at track end.
- * `dur` < 0 (unknown length) can only take a fade-in. */
+/* ---- live volume via the Windows Core Audio session of ffplay ----
+ * Every audio process has a "session" on the default output device with its
+ * own volume knob (the one in the Volume Mixer). We find ffplay's session by
+ * pid and turn that knob, so the stream is never interrupted. The GUIDs are
+ * spelled out and ole32 is loaded at runtime so the build command stays
+ * plain `gcc -O2 -Wall -o aqua.exe aqua.c`. */
+static const GUID G_CLSID_MMDevEnum = {0xBCDE0395,0xE52F,0x467C,{0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E}};
+static const GUID G_IID_MMDevEnum   = {0xA95664D2,0x9614,0x4F35,{0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6}};
+static const GUID G_IID_SessMgr2    = {0x77AA99A0,0x1BD6,0x484F,{0x8B,0xC7,0x2C,0x65,0x4C,0x9A,0x9B,0x6F}};
+static const GUID G_IID_SessCtl2    = {0xBFB7FF88,0x7239,0x4FC9,{0x8F,0xA2,0x07,0xC9,0x50,0xBE,0x9C,0x6D}};
+static const GUID G_IID_SimpleVol   = {0x87CE5498,0x68D6,0x44E5,{0x92,0x15,0x6D,0xA4,0x7E,0xF8,0x83,0xD8}};
+
+typedef HRESULT (WINAPI *PFN_CoInit)(LPVOID, DWORD);
+typedef HRESULT (WINAPI *PFN_CoCreate)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID *);
+static PFN_CoCreate p_CoCreate = NULL;
+static int com_state = 0;        /* 0 = untried, 1 = ready, -1 = unavailable */
+
+static int com_init(void) {
+    if (com_state) return com_state > 0;
+    HMODULE ole = LoadLibraryA("ole32.dll");
+    PFN_CoInit ci = ole ? (PFN_CoInit)(void *)GetProcAddress(ole, "CoInitializeEx") : NULL;
+    p_CoCreate = ole ? (PFN_CoCreate)(void *)GetProcAddress(ole, "CoCreateInstance") : NULL;
+    HRESULT hr = (ci && p_CoCreate) ? ci(NULL, COINIT_MULTITHREADED) : E_FAIL;
+    com_state = (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) ? 1 : -1;
+    return com_state > 0;
+}
+
+/* Read (do_set = 0, into *out) or write (do_set = 1, `level` 0..1) the session
+ * volume of process `pid`. Returns 1 on success, 0 if the process has no audio
+ * session yet (ffplay opens it a moment after it starts). */
+static int session_volume_op(DWORD pid, int do_set, float level, float *out) {
+    int ok = 0, n = 0;
+    IMMDeviceEnumerator *en = NULL; IMMDevice *dev = NULL;
+    IAudioSessionManager2 *mgr = NULL; IAudioSessionEnumerator *se = NULL;
+    if (!pid || !com_init()) return 0;
+    if (FAILED(p_CoCreate(&G_CLSID_MMDevEnum, NULL, CLSCTX_ALL, &G_IID_MMDevEnum, (void **)&en))) goto done;
+    if (FAILED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eMultimedia, &dev))) goto done;
+    if (FAILED(IMMDevice_Activate(dev, &G_IID_SessMgr2, CLSCTX_ALL, NULL, (void **)&mgr))) goto done;
+    if (FAILED(IAudioSessionManager2_GetSessionEnumerator(mgr, &se))) goto done;
+    IAudioSessionEnumerator_GetCount(se, &n);
+    for (int i = 0; i < n && !ok; i++) {
+        IAudioSessionControl *ctl = NULL; IAudioSessionControl2 *ctl2 = NULL;
+        ISimpleAudioVolume *vol = NULL;
+        DWORD spid = 0;
+        if (FAILED(IAudioSessionEnumerator_GetSession(se, i, &ctl))) continue;
+        if (SUCCEEDED(IAudioSessionControl_QueryInterface(ctl, &G_IID_SessCtl2, (void **)&ctl2))
+            && SUCCEEDED(IAudioSessionControl2_GetProcessId(ctl2, &spid)) && spid == pid
+            && SUCCEEDED(IAudioSessionControl_QueryInterface(ctl, &G_IID_SimpleVol, (void **)&vol))) {
+            if (do_set) {
+                ok = SUCCEEDED(ISimpleAudioVolume_SetMasterVolume(vol, level, NULL));
+            } else {
+                float v = 0;
+                ok = SUCCEEDED(ISimpleAudioVolume_GetMasterVolume(vol, &v));
+                if (out) *out = v;
+            }
+        }
+        if (vol)  ISimpleAudioVolume_Release(vol);
+        if (ctl2) IAudioSessionControl2_Release(ctl2);
+        IAudioSessionControl_Release(ctl);
+    }
+done:
+    if (se)  IAudioSessionEnumerator_Release(se);
+    if (mgr) IAudioSessionManager2_Release(mgr);
+    if (dev) IMMDevice_Release(dev);
+    if (en)  IMMDeviceEnumerator_Release(en);
+    return ok;
+}
+
+/* volume bookkeeping: `volume` (declared above) is what the UI shows. */
+static int    vol_known = -1;    /* level Windows will give a new ffplay session, -1 = unknown */
+static int    vol_touched = 0;   /* the user changed the volume during this run */
+static int    vol_sync = 0;      /* the live stream still needs to be brought to `volume` */
+static double vol_sync_t0 = 0;
+
+static void request_vol_sync(void) { vol_sync = 1; vol_sync_t0 = now_sec(); }
+
+/* Called every loop tick while vol_sync is set (and right after a key press).
+ * Until ffplay's session exists this quietly retries — it never restarts the
+ * track, which is what used to cut the sound out. */
+static void sync_volume(void) {
+    if (!vol_sync) return;
+    if (!child_h) { vol_sync = 0; return; }
+    if (vol_known < 0 && !vol_touched) {
+        /* first stream of this run: show what Windows actually remembered
+         * rather than stomping it with our default of 100 */
+        float v;
+        if (session_volume_op(child_pid, 0, 0, &v)) {
+            volume = (int)(v * 100.0f + 0.5f);
+            vol_known = volume;
+            if (fade_mult < 1.0)
+                session_volume_op(child_pid, 1, (float)(volume / 100.0 * fade_mult), NULL);
+            vol_sync = 0;
+            return;
+        }
+    } else if (session_volume_op(child_pid, 1, (float)(volume / 100.0 * fade_mult), NULL)) {
+        vol_known = volume;
+        vol_sync = 0;
+        return;
+    }
+    if (now_sec() - vol_sync_t0 > 5.0) vol_sync = 0;   /* no audio session: give up */
+}
+
+/* Ramp the live session volume for a fade-in / fade-out. Runs every loop
+ * tick; it only touches the audio session when the level actually changes. */
+static void fade_tick(void) {
+    if (cur < 0 || !child_h) { fade_mult = 1.0; fade_in_active = 0; return; }
+    double el = elapsed();
+    double m = 1.0;
+    if (fade_in_active && fade_in > 0) {
+        double t = el - fade_start_pos;
+        if (t < 0) t = 0;
+        if (t < fade_in) m = t / fade_in;
+        else fade_in_active = 0;
+    }
+    double dur = tracks[cur].dur;
+    if (fade_out > 0 && dur > 0) {
+        double rem = dur - el;
+        if (rem < fade_out) {
+            double f = rem / fade_out;
+            if (f < 0) f = 0;
+            if (f < m) m = f;
+        }
+    }
+    if (m < 0) m = 0;
+    if (m > 1) m = 1;
+    if (m != fade_mult) {
+        fade_mult = m;
+        if (session_volume_op(child_pid, 1, (float)(volume / 100.0 * fade_mult), NULL))
+            vol_known = volume;
+    }
+}
+
+#endif  /* _WIN32: thread suspend + Core Audio */
+
+/* ---- fades on Linux: ffplay's own filter chain ----
+ * ffplay runs the track through an afade filter, so no second process and no
+ * volume change outside aqua's stream is involved. A fade-out is placed at the
+ * end of the audio that is left after `startpos`; ffplay resets filter
+ * timestamps at -ss, so a seek keeps the fade at track end. `dur` < 0
+ * (unknown length) can only take a fade-in. */
+#ifndef _WIN32
 static void fade_filter(char *buf, size_t n, double startpos, double dur) {
     size_t o = 0;
     buf[0] = '\0';
@@ -1122,16 +1640,83 @@ static void fade_filter(char *buf, size_t n, double startpos, double dur) {
         }
     }
 }
+#endif
 
-static void play_track(int idx, double startpos) {
-    if (idx < 0 || idx >= ntracks) return;
-    stop_child();
-    cur = idx;
-    play_gen++;
-    base_elapsed = startpos > 0 ? startpos : 0;
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
+/* ---- child control ---- */
+static void stop_child(void) {
+#ifdef _WIN32
+    if (child_h) {
+        intentional = 1;
+        if (paused) resume_process(child_pid);
+        TerminateProcess(child_h, 0);
+        WaitForSingleObject(child_h, 2000);
+        CloseHandle(child_h);
+        child_h = NULL;
+        child_pid = 0;
+    }
+    fade_mult = 1.0;
+    fade_in_active = 0;
+#else
+    if (child > 0) {
+        intentional = 1;
+        if (paused) kill(child, SIGCONT);
+        kill(child, SIGTERM);
+        waitpid(child, NULL, 0);
+        child = -1;
+    }
+#endif
     paused = 0;
+}
 
+/* reap a naturally-finished track; returns 1 if it just ended */
+static int child_finished(void) {
+#ifdef _WIN32
+    if (!child_h) return 0;
+    if (WaitForSingleObject(child_h, 0) != WAIT_OBJECT_0) return 0;
+    CloseHandle(child_h);
+    child_h = NULL;
+    child_pid = 0;
+    return 1;
+#else
+    if (child <= 0) return 0;
+    int st;
+    pid_t r = waitpid(child, &st, WNOHANG);
+    if (r != child) return 0;
+    child = -1;
+    return 1;
+#endif
+}
+
+/* start ffplay for one track (the platform's process + volume plumbing) */
+static void start_ffplay(int idx, double startpos) {
+#ifdef _WIN32
+    /* Build a single command line for CreateProcess. ffplay is found on PATH.
+     * No -volume: the level is applied through the Windows audio session
+     * (see sync_volume), so every track and every seek shares one scale. */
+    char cmd[PATH_MAX + 256];
+    if (startpos > 0)
+        snprintf(cmd, sizeof cmd,
+            "ffplay -nodisp -autoexit -loglevel quiet -ss %.2f \"%s\"",
+            startpos, tracks[idx].path);
+    else
+        snprintf(cmd, sizeof cmd,
+            "ffplay -nodisp -autoexit -loglevel quiet \"%s\"",
+            tracks[idx].path);
+
+    STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+    PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        job_add(pi.hProcess);
+        CloseHandle(pi.hThread);
+        child_h = pi.hProcess;
+        child_pid = pi.dwProcessId;
+        request_vol_sync();      /* bring the new stream to `volume` once it exists */
+    } else {
+        child_h = NULL;
+        child_pid = 0;
+    }
+#else
     /* ffplay carries the volume itself only when no live backend can adjust
      * a running stream; otherwise keep software volume neutral and let the
      * backend own the level (so it is never applied twice). */
@@ -1161,12 +1746,42 @@ static void play_track(int idx, double startpos) {
         _exit(127);
     }
     child = pid;
-    intentional = 0;
+#endif
+}
+
+static void play_track(int idx, double startpos) {
+    if (idx < 0 || idx >= ntracks) return;
+    stop_child();
+    cur = idx;
+    play_gen++;
+    base_elapsed = startpos > 0 ? startpos : 0;
+    t_start_sec = now_sec();
+    paused = 0;
+#ifdef _WIN32
+    fade_in_active = (fade_in > 0 && startpos <= 0.0);
+    fade_start_pos = startpos > 0 ? startpos : 0;
+    fade_mult = fade_in_active ? 0.0 : 1.0;
+#else
     restart_at = 0;                    /* the new stream already carries it */
     vol_dirty = (vol_backend == VOL_PACTL && volume != 100);
+#endif
+    start_ffplay(idx, startpos);
+    intentional = 0;
 }
 
 static void toggle_pause(void) {
+#ifdef _WIN32
+    if (!child_h) return;
+    if (paused) {
+        t_start_sec = now_sec();
+        resume_process(child_pid);
+        paused = 0;
+    } else {
+        base_elapsed = elapsed();
+        suspend_process(child_pid);
+        paused = 1;
+    }
+#else
     if (child <= 0) return;
     if (paused) {
         /* if the volume changed while paused and only a respawn can apply it,
@@ -1175,7 +1790,7 @@ static void toggle_pause(void) {
             play_track(cur, base_elapsed);
             return;
         }
-        clock_gettime(CLOCK_MONOTONIC, &t_start);
+        t_start_sec = now_sec();
         kill(child, SIGCONT);
         paused = 0;
     } else {
@@ -1183,6 +1798,7 @@ static void toggle_pause(void) {
         kill(child, SIGSTOP);
         paused = 1;
     }
+#endif
 }
 
 /* position of a track index within the play queue, or -1 if not queued */
@@ -1263,8 +1879,8 @@ static int cmp_view(const void *a, const void *b) {
         return strcasecmp(track_name(ta, fa, sizeof fa), track_name(tb, fb, sizeof fb));
     }
     char ba[1024], bb[1024];
-    int c = strcasecmp(disp_title(ta, ba, sizeof ba), disp_title(tb, bb, sizeof bb));
-    if (c) return c;                                   /* Tracks tab: by title */
+    int c = strcasecmp(disp_title(ta, ba, sizeof ba), disp_title(tb, bb, sizeof bb));   /* Tracks tab: by title */
+    if (c) return c;
     char na[1024], nb[1024];
     return strcasecmp(track_name(ta, na, sizeof na), track_name(tb, nb, sizeof nb));
 }
@@ -1406,6 +2022,41 @@ static void seek(double delta) {
     play_track(cur, pos);
 }
 
+/* ---- volume ----
+ * `volume` itself is shared; how a change reaches the running stream is not.
+ * Both platforms apply it live, without restarting the track. */
+static void volume_init(void) {
+#ifndef _WIN32
+    /* pick the first backend that actually answers — presence alone isn't
+     * enough. Windows needs no detection: Core Audio is always there. */
+    if (system("pactl info >/dev/null 2>&1") == 0)              vol_backend = VOL_PACTL;
+    else if (system("wpctl status >/dev/null 2>&1") == 0)       vol_backend = VOL_WPCTL;
+    else if (system("amixer sget Master >/dev/null 2>&1") == 0) vol_backend = VOL_AMIXER;
+    else                                                        vol_backend = VOL_NONE;
+#endif
+}
+
+#ifdef _WIN32
+static void set_volume(int delta) {
+    volume += delta;
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    vol_touched = 1;
+    if (cur < 0 || !child_h) return;   /* applied when the next track starts */
+    /* Turn the live stream's knob in place — no restart, so no dropout. If
+     * ffplay hasn't opened its audio session yet the main loop retries. */
+    request_vol_sync();
+    sync_volume();
+}
+
+static void volume_tick(void) {
+    sync_volume();   /* no-op unless a volume change is still waiting on the stream */
+    fade_tick();     /* ramp the session volume during a fade-in / fade-out */
+}
+
+/* does the loop need to wake early for a pending volume change? */
+static int volume_waiting(void) { return 0; }   /* capped by PLAT_MAX_IDLE_MS */
+#else
 /* Change the volume of the live ffplay stream via PulseAudio (no restart, no
  * gap). Matches the sink-input by ffplay's PID. Returns 1 on success. */
 static int pulse_set_volume(pid_t pid, int pct) {
@@ -1431,14 +2082,6 @@ static int wire_set_volume(int pct) {
         snprintf(cmd, sizeof cmd,
                  "amixer -q sset Master %d%% >/dev/null 2>&1", pct);
     return system(cmd) == 0;
-}
-
-/* pick the first backend that actually answers — presence alone isn't enough */
-static void detect_vol_backend(void) {
-    if (system("pactl info >/dev/null 2>&1") == 0)              vol_backend = VOL_PACTL;
-    else if (system("wpctl status >/dev/null 2>&1") == 0)       vol_backend = VOL_WPCTL;
-    else if (system("amixer sget Master >/dev/null 2>&1") == 0) vol_backend = VOL_AMIXER;
-    else                                                        vol_backend = VOL_NONE;
 }
 
 static void set_volume(int delta) {
@@ -1480,6 +2123,10 @@ static void volume_tick(void) {
     }
 }
 
+/* does the loop need to wake early for a pending volume change? */
+static int volume_waiting(void) { return vol_dirty || restart_at > 0; }
+#endif
+
 /* ---- rendering ---- */
 
 /* draw() builds each frame in a fixed buffer; emit() appends to it and clamps
@@ -1493,17 +2140,6 @@ static int emit(char *buf, size_t cap, int o, const char *fmt, ...) {
     if (n < 0) return o;                    /* encoding error: drop this chunk */
     o += n;
     return o < (int)cap - 1 ? o : (int)cap - 1;
-}
-
-/* write a whole frame, retrying past partial writes and EINTR */
-static void write_all(const char *buf, int n) {
-    size_t left = (size_t)n;
-    while (left > 0) {
-        ssize_t w = write(STDOUT_FILENO, buf, left);
-        if (w > 0) { buf += w; left -= (size_t)w; }
-        else if (w < 0 && errno == EINTR) continue;
-        else break;                          /* terminal gone: drop the frame */
-    }
 }
 
 static void fmt_time(double s, char *buf, size_t n) {
@@ -1744,8 +2380,80 @@ static void scope_render(int cols, int h) {
     }
 }
 
-/* the decoder process, POSIX edition: ffmpeg writing PCM into a pipe we read
- * without blocking */
+/* the decoder process: ffmpeg writes PCM into a pipe we read without
+ * blocking, so the picture follows the playback clock. */
+#ifdef _WIN32
+static HANDLE sc_proc = NULL, sc_pipe = NULL;
+
+static void scope_stop(void) {
+    if (sc_proc) {
+        TerminateProcess(sc_proc, 0);
+        WaitForSingleObject(sc_proc, 1000);
+        CloseHandle(sc_proc);
+        sc_proc = NULL;
+    }
+    if (sc_pipe) { CloseHandle(sc_pipe); sc_pipe = NULL; }
+    sc_gen = -1;
+}
+
+static void scope_start(void) {
+    scope_stop();
+    sc_gen = play_gen;
+    sc_read = 0; sc_w = 0;
+    memset(sc_l, 0, sizeof sc_l); memset(sc_r, 0, sizeof sc_r);
+    double pos = elapsed() - sc_delay / 1000.0;
+    if (pos < 0) pos = 0;
+    sc_base = pos;
+
+    SECURITY_ATTRIBUTES sa; sa.nLength = sizeof sa; sa.lpSecurityDescriptor = NULL; sa.bInheritHandle = TRUE;
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) { sc_failed = 1; return; }
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);      /* our end stays ours */
+    HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    if (nul == INVALID_HANDLE_VALUE) nul = NULL;
+
+    char cmd[PATH_MAX + 256];
+    snprintf(cmd, sizeof cmd,
+        "ffmpeg -v quiet -nostdin -ss %.3f -i \"%s\" -vn -f s16le -ac 2 -ar %d -",
+        pos, tracks[cur].path, SC_RATE);
+    STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nul; si.hStdOutput = wr; si.hStdError = nul;
+    PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
+    if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        job_add(pi.hProcess);
+        CloseHandle(pi.hThread);
+        sc_proc = pi.hProcess;
+        sc_pipe = rd;
+        sc_failed = 0;
+    } else {
+        CloseHandle(rd);
+        sc_failed = 1;
+    }
+    CloseHandle(wr);
+    if (nul) CloseHandle(nul);
+}
+
+/* called every main-loop tick while the Scope tab is showing */
+static void scope_pump(void) {
+    if (cur < 0 || !child_h) { if (sc_proc) scope_stop(); return; }
+    if (sc_gen != play_gen) scope_start();
+    if (!sc_pipe) return;
+    long long target = (long long)((elapsed() - sc_delay / 1000.0 - sc_base) * SC_RATE);
+    static unsigned char buf[16384];
+    for (int budget = 64; sc_read < target && budget > 0; budget--) {
+        DWORD avail = 0, got = 0;
+        if (!PeekNamedPipe(sc_pipe, NULL, 0, NULL, &avail, NULL) || avail < 4) break;
+        long long want = (target - sc_read) * 4;
+        if (want > (long long)sizeof buf) want = sizeof buf;
+        if (want > (long long)avail) want = avail & ~(DWORD)3;
+        if (!ReadFile(sc_pipe, buf, (DWORD)want, &got, NULL) || got < 4) break;
+        sc_push((const short *)(void *)buf, (int)(got / 4));
+        sc_read += got / 4;
+    }
+}
+#else
 static pid_t sc_pid = -1;
 static int sc_fd = -1;
 
@@ -1823,6 +2531,7 @@ static void scope_pump(void) {
         if (carry) memmove(buf, buf + frames * 4, (size_t)carry);
     }
 }
+#endif
 
 /* ---- flicker-free rendering ----
  * The last painted frame is remembered as one 64-bit hash per screen line
@@ -1842,8 +2551,24 @@ static int  shadow_count = 0;               /* rows valid in the shadow */
 /* the current delta: bounded chunk buffer + whether anything was written */
 typedef struct { char buf[16384]; int n; int wrote; } Delta;
 
-static void delta_flush(Delta *d) {
-    if (d->n) { write_all(d->buf, d->n); d->n = 0; }
+/* write a whole chunk. POSIX retries past partial writes and EINTR; the
+ * Windows console write is a buffered fwrite of the whole chunk. */
+static void write_all(const char *buf, int n) {
+#ifdef _WIN32
+    if (n > 0) { fwrite(buf, 1, (size_t)n, stdout); fflush(stdout); }
+#else
+    size_t left = (size_t)n;
+    while (left > 0) {
+        ssize_t w = write(STDOUT_FILENO, buf, left);
+        if (w > 0) { buf += w; left -= (size_t)w; }
+        else if (w < 0 && errno == EINTR) continue;
+        else break;                          /* terminal gone: drop the frame */
+    }
+#endif
+}
+
+static void delta_flush(Delta *del) {
+    if (del->n) { write_all(del->buf, del->n); del->n = 0; }
 }
 
 /* swap the default colours for the configured ones (see settings above);
@@ -1874,18 +2599,18 @@ static const char *apply_theme(const char *line, char *out, size_t cap) {
 }
 
 /* overwrite one screen line unless its hash says it's already shown */
-static void flush_line(Delta *d, int row, const char *line) {
+static void flush_line(Delta *del, int row, const char *line) {
     if (row >= MAX_FRAME_LINES) return;
     char themed[MAX_LINE + THEME_SLACK];
     line = apply_theme(line, themed, sizeof themed);
     unsigned long long h = str_hash(line);
     if (row < shadow_count && shadow_hash[row] == h) return;
-    if (!d->wrote) {                        /* first change opens the bracket */
-        d->n = emit(d->buf, sizeof d->buf, d->n, "\033[?2026h");
-        d->wrote = 1;
+    if (!del->wrote) {                      /* first change opens the bracket */
+        del->n = emit(del->buf, sizeof del->buf, del->n, "\033[?2026h");
+        del->wrote = 1;
     }
-    d->n = emit(d->buf, sizeof d->buf, d->n, "\033[%d;1H%s\033[K", row + 1, line);
-    if (d->n > (int)sizeof d->buf - MAX_LINE - THEME_SLACK - 32) delta_flush(d);
+    del->n = emit(del->buf, sizeof del->buf, del->n, "\033[%d;1H%s\033[K", row + 1, line);
+    if (del->n > (int)sizeof del->buf - MAX_LINE - THEME_SLACK - 32) delta_flush(del);
     shadow_hash[row] = h;
 }
 
@@ -1905,8 +2630,8 @@ static void draw(void) {
     int settings = (tab == TAB_SETTINGS);
     int kb = settings && kb_open;
     int scope = (tab == TAB_SCOPE);
-    int asel   = kb ? kbsel : settings ? setsel    : scope ? 0 : album_list ? alsel   : sel;   /* active selection */
-    int acount = kb ? KB_COUNT : settings ? nset      : album_list ? nalview : nview;   /* active list length */
+    int asel   = kb ? kbsel : settings ? setsel : scope ? 0 : album_list ? alsel : sel;   /* active selection */
+    int acount = kb ? KB_COUNT : settings ? nset : album_list ? nalview : nview;   /* active list length */
 
     /* keep the active selection on screen */
     if (asel < scroll_top) scroll_top = asel;
@@ -2239,13 +2964,11 @@ static void draw(void) {
     /* help line */
     if (settings && kb_open)
         lo = emit(line, sizeof line, 0,
-            "  " DGRAY "%s" RESET,
-            kb_capture ? "press a key   " DGRAY "esc" GRAY " cancel"
-                       : DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " change  "
-                         DGRAY "backspace" GRAY " reset  " DGRAY "esc" GRAY " back");
+            "  " DGRAY "\xE2\x86\x91\xE2\x86\x93" GRAY " move  " DGRAY "\xE2\x86\xB5" GRAY " change key  "
+            DGRAY "Backspace" GRAY " reset  " DGRAY "Esc" GRAY " back" RESET);
     else if (settings && editing == 3)
         lo = emit(line, sizeof line, 0,
-            "  " DGRAY "type a length in seconds (0-60)   " DGRAY "\xE2\x86\xB5" GRAY " apply  "
+            "  " DGRAY "type seconds (0 = off)   " DGRAY "\xE2\x86\xB5" GRAY " apply  "
             DGRAY "esc" GRAY " cancel" RESET);
     else if (settings && editing == 2)
         lo = emit(line, sizeof line, 0,
@@ -2300,6 +3023,40 @@ static void draw(void) {
 }
 
 /* ---- input ---- */
+#ifdef _WIN32
+/* Returns an ASCII byte, a KEY_* code, or -1 (no key / ignored key).
+ * Windows console "extended" keys (arrows, Home/End/PgUp/PgDn, Delete...)
+ * arrive as 0xE0- or 0-prefixed scan codes; the useful ones are mapped and
+ * the rest are dropped (-1) so they can't leak garbage into the query. */
+static int read_key(void) {
+    int c = _getch();
+    if (c == 0 || c == 0xE0) {          /* extended key: a second byte follows */
+        int c2 = _getch();
+        switch (c2) {
+            case 72: return KEY_UP;     /* up */
+            case 80: return KEY_DOWN;   /* down */
+            case 77: return KEY_RIGHT;  /* right */
+            case 75: return KEY_LEFT;   /* left */
+            case 71: return KEY_HOME;   /* Home */
+            case 79: return KEY_END;    /* End */
+            case 73: return KEY_PGUP;   /* PgUp */
+            case 81: return KEY_PGDN;   /* PgDn */
+            case 15: return KEY_BTAB;   /* Shift-Tab */
+        }
+        return -1;
+    }
+    return c;
+}
+
+/* wait up to ms for a key; 1 = one is ready. The console input handle is
+ * waitable, so a key wakes the loop at once instead of after a sleep. */
+static int wait_key(int ms) {
+    if (_kbhit()) return 1;
+    if (ms <= 0) return 0;
+    if (WaitForSingleObject(hIn, (DWORD)ms) == WAIT_FAILED) Sleep((DWORD)ms);
+    return _kbhit();
+}
+#else
 static int read_byte(void) {
     unsigned char c;
     return (read(STDIN_FILENO, &c, 1) == 1) ? c : -1;
@@ -2359,14 +3116,22 @@ static int read_key(void) {
     return KEY_IGNORE;   /* sequence cut short */
 }
 
-static const char *g_argv0 = "aqua";     /* how we were started, to start over the same way */
-static volatile sig_atomic_t resized = 0;
-static volatile sig_atomic_t g_stop = 0;   /* set by SIGINT/SIGTERM/SIGHUP */
-static void on_winch(int s) { (void)s; resized = 1; }
-static void on_stop(int s) { (void)s; g_stop = 1; }
+/* wait up to ms for input (0 = poll); 1 = a key is waiting */
+static int wait_key(int ms) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+    int rv = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+    return rv > 0 && FD_ISSET(STDIN_FILENO, &fds);
+}
+#endif
 
 int main(int argc, char **argv) {
+#ifndef _WIN32
     g_argv0 = argv[0];
+#endif
+    platform_init();
     init_cache_path();
     kb_defaults();
     load_settings();                     /* first: it may name the music folder */
@@ -2387,7 +3152,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "No audio files found in '%s'.\n", dir);
         return 1;
     }
-    if (!realpath(dir, lib_dir)) snprintf(lib_dir, sizeof lib_dir, "%s", dir);
+    if (!abs_path(dir, lib_dir)) snprintf(lib_dir, sizeof lib_dir, "%s", dir);
     qsort(tracks, ntracks, sizeof(Track), cmp_track);
 
     load_cache();
@@ -2398,7 +3163,7 @@ int main(int argc, char **argv) {
      * doesn't carry 5,000 ~80-byte path strings all session. */
     for (int i = 0; i < ntracks; i++) {
         char rp[PATH_MAX];
-        const char *ap = realpath(tracks[i].path, rp) ? rp : tracks[i].path;
+        const char *ap = abs_path(tracks[i].path, rp) ? rp : tracks[i].path;
         struct stat st;
         if (stat(tracks[i].path, &st) == 0) tracks[i].mtime = (long)st.st_mtime;
         CacheEnt *e = cache_lookup(ap, tracks[i].mtime);
@@ -2434,13 +3199,17 @@ int main(int argc, char **argv) {
         }
         ncache = w;
     }
-    free(cache_buf); cache_buf = NULL;
-    /* the cache array itself: shrink to what survives (usually nothing when
-     * the whole library came from cache) — save_cache() grows it again */
-    if (ncache == 0) { free(cache); cache = NULL; capcache = 0; }
-    else if (ncache < capcache) {
-        CacheEnt *nc = realloc(cache, ncache * sizeof(CacheEnt));
-        if (nc) { cache = nc; capcache = ncache; }
+    big_free(cache_buf);                  /* pages straight back to the OS */
+    cache_buf = NULL;
+    /* the cache array: fully consumed -> release it; a few survivors (probed
+     * under another folder, or with a newer mtime) -> move them to a compact
+     * heap array and release the big one. save_cache() grows it again. */
+    if (ncache == 0) { big_free(cache); cache = NULL; capcache = 0; }
+    else {
+        CacheEnt *heapsrv = xmalloc((size_t)ncache * sizeof(CacheEnt));
+        memcpy(heapsrv, cache, (size_t)ncache * sizeof(CacheEnt));
+        big_free(cache);
+        cache = heapsrv; capcache = ncache;
     }
 #ifdef __GLIBC__
     /* the freed cache strings leave holes glibc keeps resident; give the
@@ -2455,16 +3224,7 @@ int main(int argc, char **argv) {
     build_albums();   /* album list for the Albums tab */
     if (start_tab != TAB_TRACKS) switch_tab(start_tab);   /* Settings: Start on tab */
 
-    detect_vol_backend();
-
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGWINCH, on_winch);
-    /* ^C (and TERM/HUP) must leave via the normal exit path: dying by
-     * default action would leave the terminal raw, ffplay running, and
-     * the metadata cache unsaved. */
-    signal(SIGINT, on_stop);
-    signal(SIGTERM, on_stop);
-    signal(SIGHUP, on_stop);
+    volume_init();
 
     term_raw();
     printf("\033[2J");
@@ -2479,23 +3239,16 @@ int main(int argc, char **argv) {
     double last_draw = 0;
 
     int running = 1;
-    while (running && !g_stop) {
+    while (running && !g_stop && !instance_quit_requested()) {
         /* reap a naturally-finished track -> advance */
-        if (child > 0 && !g_stop) {
-            int st;
-            pid_t r = waitpid(child, &st, WNOHANG);
-            if (r == child) {
-                child = -1;
-                if (!intentional) {
-                    if (repeat == REP_ONE && cur >= 0) play_track(cur, 0);
-                    else next_track();
-                }
+        if (child_finished()) {
+            if (!intentional) {
+                if (repeat == REP_ONE && cur >= 0) play_track(cur, 0);
+                else next_track();
             }
         }
 
-        volume_tick();   /* debounced volume restarts, live-volume retries */
-
-        if (resized) resized = 0;   /* draw() sees the new geometry and repaints in place */
+        volume_tick();   /* live-volume retries, debounced restarts, fades */
 
         int scoping = (tab == TAB_SCOPE);
         if (scoping) scope_pump();
@@ -2503,17 +3256,12 @@ int main(int argc, char **argv) {
 
         int probing = probe_idx < ntracks;
 
-        /* While probing, don't block in select — keep input snappy but make
-         * steady progress on durations. Once done, idle at a 250ms refresh
-         * (50ms while a volume change is still waiting on the stream). */
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(STDIN_FILENO, &fds);
-        int vwait = (vol_dirty || restart_at > 0);
-        struct timeval tv = { 0, probing ? 0 : moving ? 8000 : vwait ? 50000 : 250000 };
-        int rv = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
-
-        if (rv > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
+        /* While probing, poll key input without blocking so durations make
+         * steady progress; otherwise sleep until a key arrives (POSIX) or a
+         * short tick (Windows: fades and audio-session retries need it). */
+        int wait_ms = probing ? 0 : moving ? PLAT_SCOPE_MS
+                    : volume_waiting() ? 50 : PLAT_MAX_IDLE_MS;
+        if (wait_key(wait_ms)) {
             int k = read_key();
             int alist = on_album_list();
 
@@ -2724,15 +3472,15 @@ int main(int argc, char **argv) {
                         if (alist) { if (nalview > 0) open_album(alview[alsel]); }
                         else if (nview > 0) play_track(view[sel], 0);
                         break;
-                    case '\033':                                     /* esc: clear */
+                    case 27:                                         /* esc: clear */
                         searching = 0; clear_query(); apply_query();
                         break;
                     case 127: case 8:                                /* backspace */
                         if (qlen > 0) { query[--qlen] = '\0'; apply_query(); }
                         break;
                     default:
-                        /* printable ASCII and UTF-8 bytes; decoded KEY_* codes
-                         * (1000+) never reach this branch */
+                        /* printable ASCII/ANSI bytes; decoded KEY_* codes and
+                         * ignored keys (-1) never reach this branch */
                         if (k >= 32 && k < 256 && k != 127 &&
                             qlen < (int)sizeof(query) - 1) {
                             query[qlen++] = (char)k; query[qlen] = '\0';
@@ -2760,8 +3508,8 @@ int main(int argc, char **argv) {
                     case '1': case '2': case '3': case '4': case '5': case '6':
                         tab_jump(k - '1'); break;         /* jump straight to a tab */
                     case '/': searching = 1; break;
-                    case '\033': if (query[0]) { clear_query(); rebuild_albums_view(); } break;
-                    case 'q': running = 0; break;
+                    case 27: if (query[0]) { clear_query(); rebuild_albums_view(); } break;
+                    case 'q': case 3: running = 0; break;   /* Ctrl-C = byte 3 here */
                 }
             } else {
                 /* ---- track list (Tracks tab or an opened album) ---- */
@@ -2775,8 +3523,8 @@ int main(int argc, char **argv) {
                         break;
                     case 'n': next_track(); break;
                     case 'b': prev_track(); break;
-                    case KEY_RIGHT: seek(seek_step); break;
-                    case KEY_LEFT: seek(-seek_step); break;
+                    case KEY_RIGHT: seek(seek_step); break;    /* right */
+                    case KEY_LEFT: seek(-seek_step); break;    /* left */
                     case '-': case '_': set_volume(-vol_step); break;
                     case '+': case '=': set_volume(vol_step); break;
                     case 'r': repeat = (repeat + 1) % 3; save_settings(); break;
@@ -2786,7 +3534,7 @@ int main(int argc, char **argv) {
                     case '1': case '2': case '3': case '4': case '5': case '6':
                         tab_jump(k - '1'); break;         /* jump straight to a tab */
                     case '/': searching = 1; break;
-                    case '\033':                  /* esc: clear filter, else leave album */
+                    case 27:                      /* esc: clear filter, else leave album */
                         if (query[0]) { clear_query(); rebuild_view(); }
                         else if (in_album) back_to_albums();
                         break;
@@ -2797,7 +3545,7 @@ int main(int argc, char **argv) {
                     case KEY_PGDN:
                         sel = sel + page_size < nview
                             ? sel + page_size : (nview ? nview - 1 : 0); break;
-                    case 'q': running = 0; break;
+                    case 'q': case 3: running = 0; break;   /* Ctrl-C = byte 3 here */
                 }
             }
             draw();
@@ -2842,13 +3590,44 @@ int main(int argc, char **argv) {
     save_cache();          /* persist anything probed this session */
     free_arena();          /* track strings: one bulk release, no per-string frees */
     free_intern();
+#ifdef _WIN32
+    if (tracks) { VirtualFree(tracks, 0, MEM_RELEASE); tracks = NULL; }
+#else
+    free(tracks);
+    tracks = NULL;
+#endif
     term_restore();
+    platform_release();    /* the relaunch below is a new instance, not a second copy */
     if (relaunch) {
         /* Settings > Music folder: start over on the new folder. Everything
-         * above has been saved and released, so this is a clean second run -
-         * the same command line as before; the saved folder takes over. */
+         * above has been saved and released, so this is a clean second run
+         * with the same command line as before; the saved folder takes over. */
+#ifdef _WIN32
+        /* Windows has no exec: run a fresh copy in this same console, wait
+         * for it, and pass its exit code on. */
+        char exe[PATH_MAX], cmd[PATH_MAX * 2 + 16];
+        if (GetModuleFileNameA(NULL, exe, sizeof exe)) {
+            size_t al = strlen(launch_arg);
+            if (al)     /* a trailing backslash would otherwise escape the closing quote */
+                snprintf(cmd, sizeof cmd, "\"%s\" \"%s%s\"", exe, launch_arg,
+                         launch_arg[al - 1] == '\\' ? "\\" : "");
+            else
+                snprintf(cmd, sizeof cmd, "\"%s\"", exe);
+            STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+            PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
+            if (CreateProcessA(exe, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                DWORD code = 0;
+                GetExitCodeProcess(pi.hProcess, &code);
+                CloseHandle(pi.hProcess);
+                return (int)code;
+            }
+        }
+#else
         if (launch_arg[0]) execlp(g_argv0, g_argv0, launch_arg, (char *)NULL);
         else               execlp(g_argv0, g_argv0, (char *)NULL);
+#endif
         fprintf(stderr, "aqua: the music folder is saved, but aqua could not restart itself - start it again.\n");
         return 1;
     }

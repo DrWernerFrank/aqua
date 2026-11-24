@@ -3,7 +3,7 @@
 
     Run from the repo:   powershell -ExecutionPolicy Bypass -File install-windows.ps1
 
-    - Builds aqua.exe from aqua_win.c with gcc (MinGW-w64) if needed
+    - Builds aqua.exe from the shared aqua.c with gcc (MinGW-w64) if needed
     - Installs into %LOCALAPPDATA%\Programs\aqua  (per-user, no admin)
     - Creates an "aqua" Start Menu entry that opens your Music folder
     - aqua needs ffmpeg (ffplay/ffprobe) on PATH:  winget install Gyan.FFmpeg
@@ -20,7 +20,7 @@ if (-not (Test-Path $aquaExe) -or $args -contains "-Rebuild") {
         throw "gcc not found - install MinGW-w64 (e.g. winget install BrechtSanders.WinLibs.POSIX.UCRT)"
     }
     Write-Host "Building aqua.exe..."
-    & gcc -O2 -Wall -o $aquaExe (Join-Path $src "aqua_win.c")
+    & gcc -O2 -Wall -o $aquaExe (Join-Path $src "aqua.c")
 }
 
 $aquaDir = Join-Path $programs "aqua"

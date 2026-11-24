@@ -1,8 +1,8 @@
-/* Tests for the platform-independent parts of the Linux port that the
- * Windows port added last: fades and custom keybinds.
+/* Tests for the platform-independent parts of aqua: fades and custom keybinds.
  *
- * The player is one C file per platform, so the test translation unit
- * includes aqua.c directly and renames its main(). */
+ * The player is one C file for both platforms, so the test translation unit
+ * includes aqua.c directly and renames its main(). The tests use POSIX APIs
+ * and are therefore built on Linux (see the Makefile). */
 #define main aqua_main
 #include "../aqua.c"
 #undef main
