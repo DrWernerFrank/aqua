@@ -111,7 +111,7 @@ requirement; nothing else is linked).
 The same **`aqua.c`** builds natively on Windows (no WSL, no Cygwin): the
 POSIX platform layer is swapped at compile time for the Win32 Console API + VT
 sequences, `CreateProcess` + Toolhelp thread-suspend (in place of
-`fork`/`SIGSTOP`), `QueryPerformanceCounter`, and `_kbhit`/`_getch`. The
+`fork`/`SIGSTOP`), `QueryPerformanceCounter`, and `_kbhit`/`ReadConsoleInputW`. The
 metadata cache lives in `%LOCALAPPDATA%\aqua\library.tsv`. Volume is changed
 live through the Windows Core Audio session of the running `ffplay` process,
 so `+`/`-` never restart playback. That level is the one you see for

@@ -5,7 +5,7 @@
  *
  *                    Linux / POSIX            Windows
  *   terminal         termios + ANSI           Console API + VT sequences
- *   input            select() on stdin        _kbhit()/_getch()
+ *   input            select() on stdin        _kbhit()/ReadConsoleInputW()
  *   children         fork/exec + SIGSTOP      CreateProcess + thread suspend
  *   clock            clock_gettime(MONO)      QueryPerformanceCounter
  *   volume           pactl/wpctl/amixer       Core Audio session of ffplay
@@ -3024,28 +3024,64 @@ static void draw(void) {
 
 /* ---- input ---- */
 #ifdef _WIN32
-/* Returns an ASCII byte, a KEY_* code, or -1 (no key / ignored key).
- * Windows console "extended" keys (arrows, Home/End/PgUp/PgDn, Delete...)
- * arrive as 0xE0- or 0-prefixed scan codes; the useful ones are mapped and
- * the rest are dropped (-1) so they can't leak garbage into the query. */
-static int read_key(void) {
-    int c = _getch();
-    if (c == 0 || c == 0xE0) {          /* extended key: a second byte follows */
-        int c2 = _getch();
-        switch (c2) {
-            case 72: return KEY_UP;     /* up */
-            case 80: return KEY_DOWN;   /* down */
-            case 77: return KEY_RIGHT;  /* right */
-            case 75: return KEY_LEFT;   /* left */
-            case 71: return KEY_HOME;   /* Home */
-            case 79: return KEY_END;    /* End */
-            case 73: return KEY_PGUP;   /* PgUp */
-            case 81: return KEY_PGDN;   /* PgDn */
-            case 15: return KEY_BTAB;   /* Shift-Tab */
+/* Letter keys on the QWERTY row/rows, by hardware scan code, so that the
+ * same physical key still works when a non-Latin keyboard layout is active. */
+static int latin_for_scan(const KEY_EVENT_RECORD *ke) {
+    static const struct { WORD sc; char ch; } keys[] = {
+        {0x10,'q'}, {0x11,'w'}, {0x12,'e'}, {0x13,'r'}, {0x14,'t'}, {0x15,'y'},
+        {0x16,'u'}, {0x17,'i'}, {0x18,'o'}, {0x19,'p'}, {0x1E,'a'}, {0x1F,'s'},
+        {0x20,'d'}, {0x21,'f'}, {0x22,'g'}, {0x23,'h'}, {0x24,'j'}, {0x25,'k'},
+        {0x26,'l'}, {0x2C,'z'}, {0x2D,'x'}, {0x2E,'c'}, {0x2F,'v'}, {0x30,'b'},
+        {0x31,'n'}, {0x32,'m'}, {0x35,'/'},
+    };
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        if (keys[i].sc != ke->wVirtualScanCode) continue;
+        char ch = keys[i].ch;
+        if (ch >= 'a' && ch <= 'z') {
+            int shift = (ke->dwControlKeyState & SHIFT_PRESSED) != 0;
+            int caps  = (ke->dwControlKeyState & CAPSLOCK_ON) != 0;
+            if (shift != caps) ch = (char)(ch - 'a' + 'A');
         }
-        return -1;
+        return ch;
     }
-    return c;
+    return -1;
+}
+
+/* Returns an ASCII byte, a KEY_* code, or -1 (no key / ignored key).
+ * Reads key-down events from the console input queue, so the characters are
+ * those of the active keyboard layout. Non-ASCII letters (Persian, Russian,
+ * Greek...) fall back to the Latin letter on the same physical key. Windows
+ * console "extended" keys (arrows, Home/End/PgUp/PgDn...) are mapped by their
+ * virtual key, and the rest are dropped (-1) so they can't leak into the query. */
+static int key_from_event(const KEY_EVENT_RECORD *ke) {
+    switch (ke->wVirtualKeyCode) {
+        case VK_UP:     return KEY_UP;
+        case VK_DOWN:   return KEY_DOWN;
+        case VK_RIGHT:  return KEY_RIGHT;
+        case VK_LEFT:   return KEY_LEFT;
+        case VK_HOME:   return KEY_HOME;
+        case VK_END:    return KEY_END;
+        case VK_PRIOR:  return KEY_PGUP;
+        case VK_NEXT:   return KEY_PGDN;
+        case VK_TAB:
+            if (ke->dwControlKeyState & SHIFT_PRESSED) return KEY_BTAB;
+            break;
+    }
+    WCHAR u = ke->uChar.UnicodeChar;
+    if (u > 0 && u < 0x80) return u;
+    if (u >= 0x80) return latin_for_scan(ke);
+    return -1;
+}
+
+static int read_key(void) {
+    INPUT_RECORD ir;
+    DWORD n = 0;
+    while (PeekConsoleInputW(hIn, &ir, 1, &n) && n == 1) {
+        ReadConsoleInputW(hIn, &ir, 1, &n);
+        if (ir.EventType != KEY_EVENT || !ir.Event.KeyEvent.bKeyDown) continue;
+        return key_from_event(&ir.Event.KeyEvent);
+    }
+    return -1;
 }
 
 /* wait up to ms for a key; 1 = one is ready. The console input handle is
