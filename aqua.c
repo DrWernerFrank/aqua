@@ -677,6 +677,54 @@ static double base_elapsed = 0;
 static HANDLE hOut = INVALID_HANDLE_VALUE, hIn = INVALID_HANDLE_VALUE;
 static DWORD  orig_out_mode = 0, orig_in_mode = 0;
 static UINT   orig_out_cp = 0;
+
+/* Keep Windows filenames as UTF-8 internally, converting only at Win32
+ * boundaries. The narrow MinGW dirent APIs use the active ANSI code page and
+ * silently lose Persian, Arabic, and other characters outside that page. */
+static int utf8_to_wide(const char *src, WCHAR *dst, int cap) {
+    return MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, cap);
+}
+
+static int wide_to_utf8(const WCHAR *src, char *dst, int cap) {
+    return WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, cap, NULL, NULL);
+}
+
+static size_t quote_arg_w(WCHAR *dst, size_t cap, size_t o, const WCHAR *s) {
+    size_t nbs = 0;
+    if (o + 2 >= cap) return o;
+    dst[o++] = L'"';
+    for (const WCHAR *p = s; *p; p++) {
+        if (*p == L'\\') {
+            if (o + 4 >= cap) break;
+            nbs++;
+            dst[o++] = L'\\';
+        } else if (*p == L'"') {
+            if (o + nbs + 3 >= cap) break;
+            while (nbs--) dst[o++] = L'\\';
+            nbs = 0;
+            dst[o++] = L'\\'; dst[o++] = L'"';
+        } else {
+            if (o + 2 >= cap) break;
+            nbs = 0;
+            dst[o++] = *p;
+        }
+    }
+    while (nbs-- && o + 1 < cap) dst[o++] = L'\\';
+    if (o + 1 < cap) dst[o++] = L'"';
+    dst[o] = L'\0';
+    return o;
+}
+
+static long file_mtime(const char *path) {
+    WCHAR wpath[PATH_MAX];
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!utf8_to_wide(path, wpath, PATH_MAX) ||
+        !GetFileAttributesExW(wpath, GetFileExInfoStandard, &data)) return 0;
+    ULARGE_INTEGER ticks;
+    ticks.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    ticks.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    return (long)(ticks.QuadPart / 10000000ULL - 11644473600ULL);
+}
 #else
 static struct termios orig_termios;
 #endif
@@ -722,10 +770,125 @@ static const char *disp_title(const Track *t, char *buf, size_t n) {
     return (t->title && *t->title) ? t->title : track_name(t, buf, n);
 }
 
+/* Windows console cells do not perform Arabic shaping. Convert common Arabic
+ * and Persian letters to their Unicode contextual presentation forms before
+ * asking GDI for visual order. This is a display-only copy; tags stay logical. */
+#ifdef _WIN32
+typedef struct { WCHAR base, isolated, final, initial, medial; } ArabicForm;
+static const ArabicForm arabic_forms[] = {
+    {0x0621,0xFE80,0,0,0},{0x0622,0xFE81,0xFE82,0,0},{0x0623,0xFE83,0xFE84,0,0},
+    {0x0624,0xFE85,0xFE86,0,0},{0x0625,0xFE87,0xFE88,0,0},{0x0626,0xFE89,0xFE8A,0xFE8B,0xFE8C},
+    {0x0627,0xFE8D,0xFE8E,0,0},{0x0628,0xFE8F,0xFE90,0xFE91,0xFE92},
+    {0x0629,0xFE93,0xFE94,0,0},{0x062A,0xFE95,0xFE96,0xFE97,0xFE98},
+    {0x062B,0xFE99,0xFE9A,0xFE9B,0xFE9C},{0x062C,0xFE9D,0xFE9E,0xFE9F,0xFEA0},
+    {0x062D,0xFEA1,0xFEA2,0xFEA3,0xFEA4},{0x062E,0xFEA5,0xFEA6,0xFEA7,0xFEA8},
+    {0x062F,0xFEA9,0xFEAA,0,0},{0x0630,0xFEAB,0xFEAC,0,0},{0x0631,0xFEAD,0xFEAE,0,0},
+    {0x0632,0xFEAF,0xFEB0,0,0},{0x0633,0xFEB1,0xFEB2,0xFEB3,0xFEB4},
+    {0x0634,0xFEB5,0xFEB6,0xFEB7,0xFEB8},{0x0635,0xFEB9,0xFEBA,0xFEBB,0xFEBC},
+    {0x0636,0xFEBD,0xFEBE,0xFEBF,0xFEC0},{0x0637,0xFEC1,0xFEC2,0xFEC3,0xFEC4},
+    {0x0638,0xFEC5,0xFEC6,0xFEC7,0xFEC8},{0x0639,0xFEC9,0xFECA,0xFECB,0xFECC},
+    {0x063A,0xFECD,0xFECE,0xFECF,0xFED0},{0x0640,0x0640,0x0640,0x0640,0x0640},
+    {0x0641,0xFED1,0xFED2,0xFED3,0xFED4},{0x0642,0xFED5,0xFED6,0xFED7,0xFED8},
+    {0x0643,0xFED9,0xFEDA,0xFEDB,0xFEDC},{0x0644,0xFEDD,0xFEDE,0xFEDF,0xFEE0},
+    {0x0645,0xFEE1,0xFEE2,0xFEE3,0xFEE4},{0x0646,0xFEE5,0xFEE6,0xFEE7,0xFEE8},
+    {0x0647,0xFEE9,0xFEEA,0xFEEB,0xFEEC},{0x0648,0xFEED,0xFEEE,0,0},
+    {0x0649,0xFEEF,0xFEF0,0,0},{0x064A,0xFEF1,0xFEF2,0xFEF3,0xFEF4},
+    {0x067E,0xFB56,0xFB57,0xFB58,0xFB59},{0x0686,0xFB7A,0xFB7B,0xFB7C,0xFB7D},
+    {0x0698,0xFB8A,0xFB8B,0,0},{0x06A9,0xFB8E,0xFB8F,0xFB90,0xFB91},
+    {0x06AF,0xFB92,0xFB93,0xFB94,0xFB95},{0x06CC,0xFBFC,0xFBFD,0xFBFE,0xFBFF}
+};
+
+static const ArabicForm *arabic_form(WCHAR c) {
+    for (size_t i = 0; i < sizeof arabic_forms / sizeof arabic_forms[0]; i++)
+        if (arabic_forms[i].base == c) return &arabic_forms[i];
+    return NULL;
+}
+
+static int arabic_mark(WCHAR c) {
+    return (c >= 0x064B && c <= 0x065F) || c == 0x0670 ||
+           (c >= 0x06D6 && c <= 0x06ED);
+}
+
+static void shape_arabic(WCHAR *s) {
+    WCHAR in[1024];
+    size_t n = wcslen(s);
+    if (n >= _countof(in)) n = _countof(in) - 1;
+    memcpy(in, s, n * sizeof(WCHAR));
+    in[n] = 0;
+    for (size_t i = 0; i < n; i++) {
+        const ArabicForm *cur = arabic_form(in[i]);
+        if (!cur) continue;
+        const ArabicForm *prev = NULL, *next = NULL;
+        for (size_t j = i; j > 0;) {
+            --j;
+            if (arabic_mark(in[j])) continue;
+            prev = arabic_form(in[j]); break;
+        }
+        for (size_t j = i + 1; j < n; j++) {
+            if (arabic_mark(in[j])) continue;
+            next = arabic_form(in[j]); break;
+        }
+        int joins_prev = prev && prev->initial && cur->final;
+        int joins_next = next && cur->initial && next->final;
+        WCHAR form = joins_prev && joins_next ? cur->medial :
+                     joins_prev ? cur->final : joins_next ? cur->initial : cur->isolated;
+        if (form) s[i] = form;
+    }
+}
+#endif
+
+/* Reorder only a display copy; metadata remains logical-order for sorting,
+ * search, and cache storage. */
+static const char *visual_text(const char *src, char *buf, size_t cap) {
+#ifdef _WIN32
+    WCHAR logical[1024], visual[1024];
+    int n = MultiByteToWideChar(CP_UTF8, 0, src, -1, logical, _countof(logical));
+    if (!n) { snprintf(buf, cap, "%s", src); return buf; }
+    shape_arabic(logical);
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) { snprintf(buf, cap, "%s", src); return buf; }
+    GCP_RESULTSW gcp; memset(&gcp, 0, sizeof gcp);
+    gcp.lStructSize = sizeof gcp;
+    gcp.lpOutString = visual;
+    gcp.nGlyphs = (UINT)(n - 1);
+    DWORD width = GetCharacterPlacementW(dc, logical, n - 1, 0, &gcp, GCP_REORDER);
+    DeleteDC(dc);
+    if (!width && n > 1) { snprintf(buf, cap, "%s", src); return buf; }
+    visual[n - 1] = L'\0';
+    if (!WideCharToMultiByte(CP_UTF8, 0, visual, -1, buf, (int)cap, NULL, NULL))
+        snprintf(buf, cap, "%s", src);
+    return buf;
+#else
+    snprintf(buf, cap, "%s", src);
+    return buf;
+#endif
+}
+
+static const char *fit_text(const char *src, char *buf, size_t cap, int width) {
+    size_t used = 0;
+    int cells = 0;
+    while (*src && cells < width) {
+        unsigned char c = (unsigned char)*src;
+        size_t len = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 ? 2 : 1;
+        size_t available = strlen(src);
+        if (len > available || used + len >= cap) break;
+        memcpy(buf + used, src, len);
+        used += len;
+        src += len;
+        cells++;
+    }
+    while (cells < width && used + 1 < cap) { buf[used++] = ' '; cells++; }
+    buf[used] = 0;
+    return buf;
+}
+
 /* canonical absolute path, or NULL if it cannot be resolved */
 static const char *abs_path(const char *p, char *out) {
 #ifdef _WIN32
-    return _fullpath(out, p, PATH_MAX) ? out : NULL;
+    WCHAR wp[PATH_MAX], wa[PATH_MAX];
+    if (!utf8_to_wide(p, wp, PATH_MAX)) return NULL;
+    DWORD n = GetFullPathNameW(wp, PATH_MAX, wa, NULL);
+    return n && n < PATH_MAX && wide_to_utf8(wa, out, PATH_MAX) ? out : NULL;
 #else
     return realpath(p, out);
 #endif
@@ -892,6 +1055,27 @@ static void add_track(const char *path) {
 }
 
 static void scan_dir(const char *dir, int depth) {
+#ifdef _WIN32
+    char pattern[PATH_MAX];
+    WCHAR wpattern[PATH_MAX];
+    int len = snprintf(pattern, sizeof pattern, "%s\\*", dir);
+    if (len < 0 || (size_t)len >= sizeof pattern ||
+        !utf8_to_wide(pattern, wpattern, PATH_MAX)) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        char name[PATH_MAX], full[PATH_MAX];
+        if (!wide_to_utf8(fd.cFileName, name, sizeof name)) continue;
+        int n = snprintf(full, sizeof full, "%s\\%s", dir, name);
+        if (n < 0 || (size_t)n >= sizeof full) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (depth > 0) scan_dir(full, depth - 1);
+        } else if (is_audio(name)) add_track(full);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+#else
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
@@ -908,10 +1092,34 @@ static void scan_dir(const char *dir, int depth) {
         }
     }
     closedir(d);
+#endif
 }
 
 /* does this folder hold at least one audio file, as deep as the scan looks? */
 static int dir_has_audio(const char *dir, int depth) {
+#ifdef _WIN32
+    char pattern[PATH_MAX];
+    WCHAR wpattern[PATH_MAX];
+    int len = snprintf(pattern, sizeof pattern, "%s\\*", dir);
+    if (len < 0 || (size_t)len >= sizeof pattern ||
+        !utf8_to_wide(pattern, wpattern, PATH_MAX)) return 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int found = 0;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        char name[PATH_MAX], full[PATH_MAX];
+        if (!wide_to_utf8(fd.cFileName, name, sizeof name)) continue;
+        int n = snprintf(full, sizeof full, "%s\\%s", dir, name);
+        if (n < 0 || (size_t)n >= sizeof full) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (depth > 0) found = dir_has_audio(full, depth - 1);
+        } else if (is_audio(name)) found = 1;
+    } while (!found && FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+#else
     DIR *d = opendir(dir);
     if (!d) return 0;
     struct dirent *e;
@@ -928,6 +1136,7 @@ static int dir_has_audio(const char *dir, int depth) {
     }
     closedir(d);
     return found;
+#endif
 }
 
 /* Settings > Music folder, Enter: check what was typed and, if it is a folder
@@ -1003,36 +1212,6 @@ static char *intern_clean(const char *s) {
  * definitive (ffprobe ran, even if it found no duration), 0 when ffprobe
  * itself couldn't run — the file is then retried next session. */
 
-/* append s to a Windows command line, quoted the way MSVCRT argv parsing
- * expects: inner quotes are escaped and the backslashes before them doubled */
-#ifdef _WIN32
-static size_t quote_arg(char *dst, size_t cap, size_t o, const char *s) {
-    size_t nbs = 0;
-    if (o + 2 >= cap) return o;
-    dst[o++] = '"';
-    for (const char *p = s; *p; p++) {
-        if (*p == '\\') {
-            if (o + 4 >= cap) break;
-            nbs++;
-            dst[o++] = '\\';
-        } else if (*p == '"') {
-            if (o + nbs + 3 >= cap) break;
-            while (nbs--) dst[o++] = '\\';     /* double pending backslashes */
-            nbs = 0;
-            dst[o++] = '\\'; dst[o++] = '"';
-        } else {
-            if (o + 2 >= cap) break;
-            nbs = 0;
-            dst[o++] = *p;
-        }
-    }
-    while (nbs-- && o + 1 < cap) dst[o++] = '\\';   /* double trailing ones */
-    if (o + 1 < cap) dst[o++] = '"';
-    dst[o] = '\0';
-    return o;
-}
-#endif
-
 static void probe_line(Track *t, char *line) {
     char *eq = strchr(line, '=');
     if (!eq) return;
@@ -1049,13 +1228,13 @@ static void probe_line(Track *t, char *line) {
 
 #ifdef _WIN32
 static int probe_meta(Track *t) {
-    char cmd[PATH_MAX + 256];
-    size_t o = snprintf(cmd, sizeof cmd,
-        "ffprobe -v error -show_entries "
-        "format=duration:format_tags=title,artist,album,track,TITLE,ARTIST,ALBUM,TRACK "
-        "-of default=noprint_wrappers=1 ");
-    o = quote_arg(cmd, sizeof cmd, o, t->path);
-    (void)o;
+    WCHAR cmd[PATH_MAX + 256], wpath[PATH_MAX];
+    const WCHAR prefix[] = L"ffprobe -v error -show_entries "
+        L"format=duration:format_tags=title,artist,album,track,TITLE,ARTIST,ALBUM,TRACK "
+        L"-of default=noprint_wrappers=1 ";
+    if (!utf8_to_wide(t->path, wpath, PATH_MAX) || wcslen(prefix) >= _countof(cmd)) return 0;
+    wcscpy(cmd, prefix);
+    quote_arg_w(cmd, _countof(cmd), wcslen(cmd), wpath);
 
     SECURITY_ATTRIBUTES sa; memset(&sa, 0, sizeof sa);
     sa.nLength = sizeof sa; sa.bInheritHandle = TRUE;
@@ -1064,13 +1243,13 @@ static int probe_meta(Track *t) {
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
     HANDLE nul = CreateFileA("NUL", GENERIC_WRITE, 0, &sa, OPEN_EXISTING, 0, NULL);
 
-    STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+    STARTUPINFOW si; memset(&si, 0, sizeof si); si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = wr;
     si.hStdError  = (nul != INVALID_HANDLE_VALUE) ? nul : wr;
     si.hStdInput  = INVALID_HANDLE_VALUE;
     PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE,
                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(rd); CloseHandle(wr);
         if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
@@ -1693,19 +1872,19 @@ static void start_ffplay(int idx, double startpos) {
     /* Build a single command line for CreateProcess. ffplay is found on PATH.
      * No -volume: the level is applied through the Windows audio session
      * (see sync_volume), so every track and every seek shares one scale. */
-    char cmd[PATH_MAX + 256];
+    WCHAR cmd[PATH_MAX + 256], wpath[PATH_MAX];
+    int n;
+    if (!utf8_to_wide(tracks[idx].path, wpath, PATH_MAX)) { child_h = NULL; child_pid = 0; return; }
     if (startpos > 0)
-        snprintf(cmd, sizeof cmd,
-            "ffplay -nodisp -autoexit -loglevel quiet -ss %.2f \"%s\"",
-            startpos, tracks[idx].path);
+        n = swprintf(cmd, _countof(cmd), L"ffplay -nodisp -autoexit -loglevel quiet -ss %.2f ", startpos);
     else
-        snprintf(cmd, sizeof cmd,
-            "ffplay -nodisp -autoexit -loglevel quiet \"%s\"",
-            tracks[idx].path);
+        n = swprintf(cmd, _countof(cmd), L"ffplay -nodisp -autoexit -loglevel quiet ");
+    if (n < 0 || (size_t)n >= _countof(cmd)) { child_h = NULL; child_pid = 0; return; }
+    quote_arg_w(cmd, _countof(cmd), (size_t)n, wpath);
 
-    STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+    STARTUPINFOW si; memset(&si, 0, sizeof si); si.cb = sizeof si;
     PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
-    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         job_add(pi.hProcess);
         CloseHandle(pi.hThread);
@@ -2413,15 +2592,27 @@ static void scope_start(void) {
                              FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
     if (nul == INVALID_HANDLE_VALUE) nul = NULL;
 
-    char cmd[PATH_MAX + 256];
-    snprintf(cmd, sizeof cmd,
-        "ffmpeg -v quiet -nostdin -ss %.3f -i \"%s\" -vn -f s16le -ac 2 -ar %d -",
-        pos, tracks[cur].path, SC_RATE);
-    STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
+    WCHAR cmd[PATH_MAX + 256], wpath[PATH_MAX];
+    if (!utf8_to_wide(tracks[cur].path, wpath, PATH_MAX)) {
+        CloseHandle(rd); CloseHandle(wr); if (nul) CloseHandle(nul);
+        sc_failed = 1; return;
+    }
+    int cn = swprintf(cmd, _countof(cmd), L"ffmpeg -v quiet -nostdin -ss %.3f -i ", pos);
+    if (cn < 0 || (size_t)cn >= _countof(cmd)) {
+        CloseHandle(rd); CloseHandle(wr); if (nul) CloseHandle(nul);
+        sc_failed = 1; return;
+    }
+    cn = (int)quote_arg_w(cmd, _countof(cmd), (size_t)cn, wpath);
+    if ((size_t)cn + 64 >= _countof(cmd)) {
+        CloseHandle(rd); CloseHandle(wr); if (nul) CloseHandle(nul);
+        sc_failed = 1; return;
+    }
+    wcscat(cmd, L" -vn -f s16le -ac 2 -ar 44100 -");
+    STARTUPINFOW si; memset(&si, 0, sizeof si); si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = nul; si.hStdOutput = wr; si.hStdError = nul;
     PROCESS_INFORMATION pi; memset(&pi, 0, sizeof pi);
-    if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         job_add(pi.hProcess);
         CloseHandle(pi.hThread);
         sc_proc = pi.hProcess;
@@ -2551,11 +2742,38 @@ static int  shadow_count = 0;               /* rows valid in the shadow */
 /* the current delta: bounded chunk buffer + whether anything was written */
 typedef struct { char buf[16384]; int n; int wrote; } Delta;
 
-/* write a whole chunk. POSIX retries past partial writes and EINTR; the
- * Windows console write is a buffered fwrite of the whole chunk. */
+/* write a whole chunk. POSIX retries past partial writes and EINTR. On
+ * Windows, send UTF-16 directly to a console handle: relying on the active
+ * console output code page can replace UTF-8 track names with question marks.
+ * Redirected output remains UTF-8 bytes. */
 static void write_all(const char *buf, int n) {
 #ifdef _WIN32
-    if (n > 0) { fwrite(buf, 1, (size_t)n, stdout); fflush(stdout); }
+    if (n <= 0) return;
+    DWORD mode;
+    if (hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode)) {
+        int wn = MultiByteToWideChar(CP_UTF8, 0, buf, n, NULL, 0);
+        if (wn > 0) {
+            WCHAR *wide = (WCHAR *)malloc((size_t)wn * sizeof(WCHAR));
+            if (wide) {
+                if (MultiByteToWideChar(CP_UTF8, 0, buf, n, wide, wn) == wn) {
+                    fflush(stdout);
+                    DWORD off = 0;
+                    while (off < (DWORD)wn) {
+                        DWORD written = 0;
+                        if (!WriteConsoleW(hOut, wide + off, (DWORD)wn - off,
+                                           &written, NULL) || written == 0)
+                            break;
+                        off += written;
+                    }
+                    free(wide);
+                    return;
+                }
+                free(wide);
+            }
+        }
+    }
+    fwrite(buf, 1, (size_t)n, stdout);
+    fflush(stdout);
 #else
     size_t left = (size_t)n;
     while (left > 0) {
@@ -2696,12 +2914,16 @@ static void draw(void) {
         lo = emit(line, sizeof line, 0,
             "  " AQUA "/" WHITE "%s" AQUA "\xE2\x96\x88" RESET
             DGRAY "   %d matches" RESET, query, acount);
-    else if (in_album)
+    else if (in_album) {
+        char album_text[1024];
+        const char *shown_album = visual_text(cur_album ? cur_album : "",
+                                              album_text, sizeof album_text);
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "%s \xE2\x96\xB8 " AQUA "%s" DGRAY
             "   %d tracks%s%s  (esc: back)" RESET,
-            browse_label(), cur_album ? cur_album : "", nview,
+            browse_label(), shown_album, nview,
             query[0] ? "  filter: " : "", query[0] ? query : "");
+    }
     else if (query[0])
         lo = emit(line, sizeof line, 0,
             "  " DGRAY "filter: " AQUA "%s" DGRAY "  (esc to clear)" RESET, query);
@@ -2871,18 +3093,23 @@ static void draw(void) {
         if (album_list) {                        /* ---- album row ---- */
             int ai = alview[r];
             const char *an = albums[ai];
+            char album_text[1024];
+            const char *shown_album = visual_text(*an ? an : "(unknown)",
+                                                  album_text, sizeof album_text);
             char cbuf[24];
             snprintf(cbuf, sizeof cbuf, "%d \xE2\x99\xAA", album_n[ai]);
             int nw = cols - 12;
             if (nw < 8) nw = 8;
+            char fitted_album[2048];
+            shown_album = fit_text(shown_album, fitted_album, sizeof fitted_album, nw);
             if (r == alsel)
                 lo = emit(line, sizeof line, 0,
-                    INVAQ " %-*.*s %6s " RESET,
-                    nw, nw, *an ? an : "(unknown)", cbuf);
+                    INVAQ " %s %6s " RESET,
+                    shown_album, cbuf);
             else
                 lo = emit(line, sizeof line, 0,
-                    " " WHITE "%-*.*s" RESET " " DGRAY "%6s" RESET,
-                    nw, nw, *an ? an : "(unknown)", cbuf);
+                    " " WHITE "%s" RESET " " DGRAY "%6s" RESET,
+                    shown_album, cbuf);
             flush_line(&del, row++, line);
             continue;
         }
@@ -2902,16 +3129,20 @@ static void draw(void) {
         if (name_w < 8) name_w = 8;
         char nbuf[1024];
         const char *title = disp_title(t, nbuf, sizeof nbuf);
+        char title_text[1024];
+        title = visual_text(title, title_text, sizeof title_text);
+        char fitted_title[2048];
+        title = fit_text(title, fitted_title, sizeof fitted_title, name_w);
 
         if (r == sel)
             lo = emit(line, sizeof line, 0,
-                INVAQ " %s%s %-*.*s %5s " RESET,
-                marker, num, name_w, name_w, title, dbuf);
+                INVAQ " %s%s %s %5s " RESET,
+                marker, num, title, dbuf);
         else {
             const char *col = (idx == cur) ? AQUA : WHITE;
             lo = emit(line, sizeof line, 0,
-                " %s%s" DGRAY "%s " RESET "%s%-*.*s" RESET " " DGRAY "%5s" RESET,
-                col, marker, num, col, name_w, name_w, title, dbuf);
+                " %s%s" DGRAY "%s " RESET "%s%s" RESET " " DGRAY "%5s" RESET,
+                col, marker, num, col, title, dbuf);
         }
         flush_line(&del, row++, line);
     }
@@ -2937,9 +3168,13 @@ static void draw(void) {
                      dtitle, tracks[cur].artist);
         else
             snprintf(now, sizeof now, "%s", dtitle);
+        char now_text[1024];
+        const char *shown_now = visual_text(now, now_text, sizeof now_text);
+        char fitted_now[2048];
+        shown_now = fit_text(shown_now, fitted_now, sizeof fitted_now, cols - 14);
         lo = emit(line, sizeof line, 0,
-            "  %s" RESET " " WHITE "%-*.*s" RESET,
-            state, cols - 14, cols - 14, now);
+            "  %s" RESET " " WHITE "%s" RESET,
+            state, shown_now);
         flush_line(&del, row++, line);
 
         /* progress bar */
@@ -3200,8 +3435,12 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ntracks; i++) {
         char rp[PATH_MAX];
         const char *ap = abs_path(tracks[i].path, rp) ? rp : tracks[i].path;
+#ifdef _WIN32
+        tracks[i].mtime = file_mtime(tracks[i].path);
+#else
         struct stat st;
         if (stat(tracks[i].path, &st) == 0) tracks[i].mtime = (long)st.st_mtime;
+#endif
         CacheEnt *e = cache_lookup(ap, tracks[i].mtime);
         if (e) {
             tracks[i].dur = e->dur;          /* may be -1: probed, no duration */

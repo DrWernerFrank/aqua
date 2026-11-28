@@ -7,6 +7,7 @@ VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)
 # The same source builds both ports; only the binary name differs.
 ifeq ($(OS),Windows_NT)
 BIN = aqua.exe
+LDLIBS += -lgdi32
 else
 BIN = aqua
 endif
@@ -17,7 +18,7 @@ DISTTGZ = $(DISTDIR).tar.gz
 all: $(BIN)
 
 $(BIN): aqua.c
-	$(CC) $(CFLAGS) -o $(BIN) aqua.c
+	$(CC) $(CFLAGS) -o $(BIN) aqua.c $(LDLIBS)
 
 ifneq ($(OS),Windows_NT)
 tests/test_aqua: tests/test_aqua.c aqua.c

@@ -126,7 +126,7 @@ running copy to quit first (and waits for it).
 
 ```powershell
 # Requirements: a MinGW-w64 gcc, plus ffmpeg on PATH (winget install Gyan.FFmpeg)
-gcc -O2 -Wall -o aqua.exe aqua.c
+gcc -O2 -Wall -o aqua.exe aqua.c -lgdi32
 aqua.exe "%USERPROFILE%\Music"
 ```
 

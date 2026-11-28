@@ -20,7 +20,7 @@ if (-not (Test-Path $aquaExe) -or $args -contains "-Rebuild") {
         throw "gcc not found - install MinGW-w64 (e.g. winget install BrechtSanders.WinLibs.POSIX.UCRT)"
     }
     Write-Host "Building aqua.exe..."
-    & gcc -O2 -Wall -o $aquaExe (Join-Path $src "aqua.c")
+    & gcc -O2 -Wall -o $aquaExe (Join-Path $src "aqua.c") -lgdi32
 }
 
 $aquaDir = Join-Path $programs "aqua"
